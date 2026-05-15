@@ -76,6 +76,12 @@ cd bc-assessment-service
 ```
 
 or get from github
+```
+git clone ......
+cd /root/bc-assessment-service
+
+
+```
 
 
 ### Create virtual environment (`SCRAP`)
@@ -93,6 +99,16 @@ Deactivate when done: `deactivate`
 pip install -r requirements.txt
 playwright install chromium
 ```
+in linux is better to run 
+```bsh
+playwright install-deps chromium
+```
+
+if fails try :
+```bsh
+sudo apt install -y libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 libasound2
+```
+
 
 ### Enviuronement variables
 in .env.example:
@@ -151,17 +167,25 @@ Copy from `.env.example` into `.env` to override.
 Example unit file /etc/systemd/system/bc-assessment.service:
 
 ```bsh
+cd /etc/systemd/system/
+vim bc-assessment.service
+```
+
+
+```bsh
 [Unit]
 Description=BC Assessment API
 After=network.target
+
 [Service]
 Type=simple
-User=www-data
-WorkingDirectory=/opt/bc-assessment-service
-Environment=PATH=/opt/bc-assessment-service/SCRAP/bin
-ExecStart=/opt/bc-assessment-service/SCRAP/bin/uvicorn app.main:app --host 0.0.0.0 --port 8011
+User=root
+WorkingDirectory=/root/bc-assessment-service
+Environment=PATH=/root/bc-assessment-service/SCRAP/bin
+ExecStart=/root/bc-assessment-service/SCRAP/bin/uvicorn app.main:app --host 0.0.0.0 --port 8011
 Restart=always
 RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 
