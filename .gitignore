@@ -1,0 +1,9 @@
+.venv/
+SCRAP/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.mypy_cache/
+playwright-report/
+test-results/
