@@ -227,3 +227,10 @@ Replace YOUR_LINUX_HOST with server IP or domain. If BlueNest runs in Docker on 
 
 
 
+
+final test
+
+```bsh
+curl -G "http://getplutus.solutions/bc-assessment/address" \
+--data-urlencode "address=7009 TISDALL ST VANCOUVER"
+```
