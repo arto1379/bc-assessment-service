@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-import time
 from typing import Optional
 
 from bs4 import BeautifulSoup
@@ -15,6 +14,7 @@ from playwright.async_api import (
 )
 
 from app.config import settings
+from app.db.cache import cache_get, cache_set
 from app.schemas import AssessmentResult
 
 logger = logging.getLogger(__name__)
@@ -39,33 +39,9 @@ _page: Optional[Page] = None
 _browser_lock = asyncio.Lock()
 _scrape_lock = asyncio.Semaphore(1)
 
-_cache: dict[str, tuple[float, AssessmentResult]] = {}
-
 
 def _normalize_address(address: str) -> str:
     return re.sub(r"\s+", " ", address.strip().upper())
-
-
-def _cache_get(key: str) -> Optional[AssessmentResult]:
-    if settings.scrape_cache_ttl_seconds <= 0:
-        return None
-    entry = _cache.get(key)
-    if not entry:
-        return None
-    expires_at, result = entry
-    if time.monotonic() > expires_at:
-        _cache.pop(key, None)
-        return None
-    return result
-
-
-def _cache_set(key: str, result: AssessmentResult) -> None:
-    if settings.scrape_cache_ttl_seconds <= 0:
-        return
-    _cache[key] = (
-        time.monotonic() + settings.scrape_cache_ttl_seconds,
-        result,
-    )
 
 
 def _clean(text: str | None) -> Optional[str]:
@@ -255,27 +231,26 @@ async def lookup_by_address(address: str) -> Optional[AssessmentResult]:
     
     normalized = _normalize_address(address)
     logger.info("BC scrape lookup_by_address normalized=%r", normalized)
-    cached = _cache_get(normalized)
-    logger.info("BC scrape lookup_by_address cached=%r", cached)
+
+    cached = cache_get(normalized)
     if cached is not None:
-        logger.debug("BC scrape cache hit (exist) for address=%r", address)
+        logger.info("BC scrape SQLite cache hit for address=%r", address)
         return cached
 
     async with _scrape_lock:
-        cached = _cache_get(normalized)
+        cached = cache_get(normalized)
         if cached is not None:
             return cached
 
-        logger.info("BC scrape lookup_by_address scraping address=%r", address)
-
+        logger.info("BC scrape cache miss; scraping address=%r", address)
         result = await _scrape_bcassessment(address.strip())
         if result is not None:
-            _cache_set(normalized, result)
+            cache_set(normalized, result)
         return result
 
 
 async def shutdown_browser() -> None:
-    global _playwright, _browser, _context, _page, _cache
+    global _playwright, _browser, _context, _page
     async with _browser_lock:
         if _page is not None and not _page.is_closed():
             await _page.close()
@@ -289,4 +264,3 @@ async def shutdown_browser() -> None:
         if _playwright is not None:
             await _playwright.stop()
         _playwright = None
-    _cache.clear()

@@ -53,17 +53,20 @@ python3 --version
 bc-assessment-service/
 ├── README.md
 ├── requirements.txt
+├── scripts/
+│   └── setup_db.py      # one-time SQLite cache setup
+├── data/                # SQLite DB (local only, do not commit)
 ├── SCRAP/               # Python virtualenv (local only, do not commit)
 ├── .env.example
 ├── .env                 # local only, do not commit
 └── app/
-    ├── __init__.py
     ├── main.py          # FastAPI routes
-    ├── config.py        # host, port
+    ├── config.py        # host, port, database path
     ├── schemas.py       # response models
+    ├── db/
+    │   └── cache.py     # SQLite cache read/write
     └── services/
-        ├── __init__.py
-        └── lookup.py    # lookup_by_address() — Main logic (scraping)
+        └── lookup.py    # lookup_by_address() — cache then scrape
 ```
 
 
@@ -110,16 +113,28 @@ sudo apt install -y libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 lib
 ```
 
 
-### Enviuronement variables
-in .env.example:
+### Environment variables
+in `.env.example`:
 ```bsh
 HOST=0.0.0.0
 PORT=8011
+DATABASE_PATH=data/bc_assessment.db
+SCRAPE_CACHE_TTL_SECONDS=0
 ```
 copy and edit:<br>
 ```bsh
 cp .env.example .env
 ```
+
+### One-time database setup (SQLite cache)
+
+Run once before the first server start:
+
+```bsh
+python scripts/setup_db.py
+```
+
+This creates `data/bc_assessment.db` with an `assessment_cache` table (`id`, `address`, assessment fields, `created_at`). Every lookup checks this cache first; on a miss it scrapes bcassessment.ca and stores the result. BC Assessment data changes about once per year, so the default TTL is `0` (never expire).
 
 ### run the server
 
@@ -146,14 +161,15 @@ curl -G "http://localhost:8011/address" \
   --data-urlencode "address=7009 TISDALL ST VANCOUVER"
 ```
 
-The first request after startup may take ~10–20s (browser warmup). Repeat lookups for the same address are instant (in-memory cache). New addresses are typically faster than before (~8–15s) because the scraper reuses one browser tab and skips slow `networkidle` waits.
+The first request after startup may take ~10–20s (browser warmup). Repeat lookups for the same address are instant (SQLite cache). New addresses are typically faster than before (~8–15s) because the scraper reuses one browser tab and skips slow `networkidle` waits.
 
 ### Performance tuning (optional `.env`)
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `DATABASE_PATH` | `data/bc_assessment.db` | SQLite cache file path |
+| `SCRAPE_CACHE_TTL_SECONDS` | `0` | Cache entry lifetime in seconds (`0` = never expire) |
 | `SCRAPE_WARMUP_ON_START` | `true` | Pre-load bcassessment.ca when the server starts |
-| `SCRAPE_CACHE_TTL_SECONDS` | `3600` | Cache results per address (set `0` to disable) |
 | `SCRAPE_AUTOCOMPLETE_TIMEOUT_MS` | `8000` | Max wait for search suggestions |
 | `SCRAPE_RESULT_TIMEOUT_MS` | `25000` | Max wait for property page content |
 

@@ -2,7 +2,8 @@
 SCRAP/
 __pycache__/
 *.py[cod]
-.env
+data/
+*.db
 .pytest_cache/
 .mypy_cache/
 playwright-report/
