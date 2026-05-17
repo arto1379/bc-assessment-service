@@ -1,4 +1,4 @@
-"""Sliding-window rate limiters for bcassessment.ca requests."""
+"""Rate limiters for bcassessment.ca requests (window caps + minimum spacing)."""
 
 from __future__ import annotations
 
@@ -6,10 +6,18 @@ import asyncio
 import logging
 import time
 from collections import deque
+from typing import Protocol
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class _RateLimiter(Protocol):
+    @property
+    def enabled(self) -> bool: ...
+
+    async def acquire(self) -> None: ...
 
 
 class BCRateLimiter:
@@ -60,10 +68,42 @@ class BCRateLimiter:
                 await asyncio.sleep(max(wait_seconds, 0.05))
 
 
+class BCMinIntervalLimiter:
+    """Enforce a minimum delay between consecutive BC site operations."""
+
+    def __init__(self, min_interval_seconds: float, *, label: str = "BC spacing") -> None:
+        self.min_interval_seconds = min_interval_seconds
+        self.label = label
+        self._last_at: float | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self.min_interval_seconds > 0
+
+    async def acquire(self) -> None:
+        if not self.enabled:
+            return
+
+        async with self._lock:
+            now = time.monotonic()
+            if self._last_at is not None:
+                wait_seconds = self.min_interval_seconds - (now - self._last_at)
+                if wait_seconds > 0:
+                    logger.info(
+                        "%s: waiting %.1fs (min %.1fs between requests)",
+                        self.label,
+                        wait_seconds,
+                        self.min_interval_seconds,
+                    )
+                    await asyncio.sleep(wait_seconds)
+            self._last_at = time.monotonic()
+
+
 class BCRateLimitGroup:
     """Apply multiple rate-limit tiers (all must pass before proceeding)."""
 
-    def __init__(self, *limiters: BCRateLimiter) -> None:
+    def __init__(self, *limiters: _RateLimiter) -> None:
         self._limiters = [lim for lim in limiters if lim.enabled]
 
     async def acquire(self) -> None:
@@ -72,6 +112,10 @@ class BCRateLimitGroup:
 
 
 bc_rate_limiter = BCRateLimitGroup(
+    BCMinIntervalLimiter(
+        settings.bc_rate_limit_min_interval_seconds,
+        label="BC spacing",
+    ),
     BCRateLimiter(
         settings.bc_rate_limit_max,
         settings.bc_rate_limit_window_seconds,

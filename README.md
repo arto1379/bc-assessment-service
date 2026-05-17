@@ -173,6 +173,7 @@ The first request after startup may take ~10–20s (browser warmup). Repeat look
 | `BC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Short-term window in seconds |
 | `BC_RATE_LIMIT_HOURLY_MAX` | `1000` | Hourly max scrapes (`0` = disable tier) |
 | `BC_RATE_LIMIT_HOURLY_WINDOW_SECONDS` | `3600` | Hourly window in seconds (1 hour) |
+| `BC_RATE_LIMIT_MIN_INTERVAL_SECONDS` | `2` | Minimum seconds between BC requests (`0` = disable) |
 | `SCRAPE_WARMUP_ON_START` | `true` | Pre-load bcassessment.ca when the server starts |
 | `SCRAPE_AUTOCOMPLETE_TIMEOUT_MS` | `8000` | Max wait for search suggestions |
 | `SCRAPE_RESULT_TIMEOUT_MS` | `25000` | Max wait for property page content |
