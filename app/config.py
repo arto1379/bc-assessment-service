@@ -11,11 +11,11 @@ class Settings(BaseSettings):
     scrape_cache_ttl_seconds: int = 0
 
     # Rate limit for bcassessment.ca (cache hits are not limited)
-    bc_rate_limit_max: int = 10
+    bc_rate_limit_max: int = 15
     bc_rate_limit_window_seconds: float = 60.0
-    bc_rate_limit_hourly_max: int = 1000
+    bc_rate_limit_hourly_max: int = 500
     bc_rate_limit_hourly_window_seconds: float = 3600.0
-    bc_rate_limit_min_interval_seconds: float = 2.0
+    bc_rate_limit_min_interval_seconds: float = 4.0
 
     # Scrape performance (see README)
     scrape_warmup_on_start: bool = True
