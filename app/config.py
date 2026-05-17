@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     # 0 = never expire (BC Assessment updates ~yearly); set e.g. 31536000 for 365 days
     scrape_cache_ttl_seconds: int = 0
 
+    # Rate limit for bcassessment.ca (cache hits are not limited)
+    bc_rate_limit_max: int = 10
+    bc_rate_limit_window_seconds: float = 60.0
+    bc_rate_limit_hourly_max: int = 1000
+    bc_rate_limit_hourly_window_seconds: float = 3600.0
+
     # Scrape performance (see README)
     scrape_warmup_on_start: bool = True
     scrape_autocomplete_timeout_ms: int = 8_000

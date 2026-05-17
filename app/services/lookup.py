@@ -16,6 +16,7 @@ from playwright.async_api import (
 from app.config import settings
 from app.db.cache import cache_get, cache_set
 from app.schemas import AssessmentResult
+from app.services.rate_limit import bc_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -164,12 +165,15 @@ async def warmup_browser() -> None:
     if not settings.scrape_warmup_on_start:
         return
     async with _scrape_lock:
+        await bc_rate_limiter.acquire()
         page = await _get_page()
         await _ensure_home(page)
     logger.info("BC Assessment browser warmed up")
 
 
 async def _scrape_bcassessment(address: str) -> Optional[AssessmentResult]:
+    await bc_rate_limiter.acquire()
+
     page = await _get_page()
 
     try:
