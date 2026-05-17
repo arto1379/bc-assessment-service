@@ -200,9 +200,12 @@ async def _scrape_bcassessment(address: str) -> Optional[AssessmentResult]:
         await _ensure_home(page)
 
         search = page.locator(SEARCH_SELECTOR)
+        logger.info("[1_SEARCH] BC scrape lookup_by_address search")
         await search.click()
         await search.fill("")
         await search.fill(address)
+
+        logger.info("[2_fill] BC scrape lookup_by_address search")
 
         await page.wait_for_selector(
             AUTOCOMPLETE_SELECTOR,
@@ -211,13 +214,19 @@ async def _scrape_bcassessment(address: str) -> Optional[AssessmentResult]:
         )
         await page.locator(f"{AUTOCOMPLETE_SELECTOR}").first.click()
 
+        logger.info("[3_AUTOCOMPLETE] BC scrape lookup_by_address search")
+
         await page.wait_for_function(
             RESULT_READY_JS,
             timeout=settings.scrape_result_timeout_ms,
         )
 
+        logger.info("[4_GETTING_HTML] BC scrape lookup_by_address search")
+
         html = await page.content()
         result = _parse_html(html)
+
+        logger.info("[5_PARSING_HTML] BC scrape lookup_by_address search")
 
         if not result.total_value:
             logger.warning(
@@ -238,19 +247,26 @@ async def _scrape_bcassessment(address: str) -> Optional[AssessmentResult]:
 
 async def lookup_by_address(address: str) -> Optional[AssessmentResult]:
     """Return assessment data for an address, or None if not found."""
-    if not address or not address.strip():
-        return None
+    logger.info("BC scrape lookup_by_address address=%r", address)
 
+    if not address or not address.strip():
+        logger.warning("BC scrape lookup_by_address address is empty")
+        return None
+    
     normalized = _normalize_address(address)
+    logger.info("BC scrape lookup_by_address normalized=%r", normalized)
     cached = _cache_get(normalized)
+    logger.info("BC scrape lookup_by_address cached=%r", cached)
     if cached is not None:
-        logger.debug("BC scrape cache hit for address=%r", address)
+        logger.debug("BC scrape cache hit (exist) for address=%r", address)
         return cached
 
     async with _scrape_lock:
         cached = _cache_get(normalized)
         if cached is not None:
             return cached
+
+        logger.info("BC scrape lookup_by_address scraping address=%r", address)
 
         result = await _scrape_bcassessment(address.strip())
         if result is not None:
