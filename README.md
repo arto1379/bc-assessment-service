@@ -177,8 +177,31 @@ The first request after startup may take ~10–20s (browser warmup). Repeat look
 | `SCRAPE_WARMUP_ON_START` | `true` | Pre-load bcassessment.ca when the server starts |
 | `SCRAPE_AUTOCOMPLETE_TIMEOUT_MS` | `8000` | Max wait for search suggestions |
 | `SCRAPE_RESULT_TIMEOUT_MS` | `25000` | Max wait for property page content |
+| `TELEGRAM_BOT_TOKEN` | _(empty)_ | Bot token from [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_CHAT_IDS` | _(empty)_ | Comma-separated chat IDs, e.g. `6985166589,109329798` |
+| `STATS_MILESTONE_COUNT` | `100` | Reset counters and alert when cache or BC hits reach this |
 
 Copy from `.env.example` into `.env` to override.
+
+### Telegram alerts
+
+Add to `.env` (do **not** commit the real token):
+
+```bash
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+TELEGRAM_CHAT_IDS=6985166589,109329798
+STATS_MILESTONE_COUNT=100
+```
+
+In-memory counters track cache hits and BC scrapes. When **either** reaches `STATS_MILESTONE_COUNT`, both counters reset and both chat IDs get a summary message.
+
+Immediate alerts are sent for:
+
+- Empty / whitespace address
+- Property not found
+- Invalid result (e.g. missing `total_value`)
+
+Check live counts: `GET /stats` → `{"cache_calls": 12, "bc_calls": 3}`
 
 
 

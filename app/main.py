@@ -4,6 +4,7 @@ from fastapi import FastAPI, Query
 
 from app.schemas import AssessmentData, ErrorResponse, SuccessResponse
 from app.services.lookup import lookup_by_address, shutdown_browser, warmup_browser
+from app.services.stats import get_stats
 
 
 @asynccontextmanager
@@ -20,7 +21,8 @@ app = FastAPI(title="BC Assessment Proxy", version="0.1.0", lifespan=lifespan)
 async def get_address(
     address: str = Query(..., min_length=1, description="Formatted address string"),
 ):
-    result = await lookup_by_address(address.strip())
+    address = address.strip()
+    result = await lookup_by_address(address)
 
     if result is None:
         return ErrorResponse(status="error", message="Property not found")
@@ -33,6 +35,11 @@ async def get_address(
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/stats")
+async def stats():
+    return await get_stats()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,21 @@ class Settings(BaseSettings):
     scrape_autocomplete_timeout_ms: int = 8_000
     scrape_result_timeout_ms: int = 25_000
 
+    # Telegram alerts (set in .env — never commit real token)
+    telegram_bot_token: str = "8816015658:AAEVkHZWrkl_1qWfvCwOrIJbPMK1QLeQd1I"
+    telegram_chat_ids: str = "6985166589,109329798"  # comma-separated
+    stats_milestone_count: int = 100
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    def get_telegram_chat_ids(self) -> list[int]:
+        if not self.telegram_chat_ids.strip():
+            return []
+        return [
+            int(part.strip())
+            for part in self.telegram_chat_ids.split(",")
+            if part.strip()
+        ]
 
 
 settings = Settings()

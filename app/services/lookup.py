@@ -17,6 +17,14 @@ from app.config import settings
 from app.db.cache import cache_get, cache_set
 from app.schemas import AssessmentResult
 from app.services.rate_limit import bc_rate_limiter
+from app.services.stats import (
+    is_valid_assessment,
+    notify_invalid_result,
+    notify_no_address,
+    notify_not_found,
+    record_bc_scrape,
+    record_cache_hit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,25 +239,38 @@ async def lookup_by_address(address: str) -> Optional[AssessmentResult]:
 
     if not address or not address.strip():
         logger.warning("BC scrape lookup_by_address address is empty")
+        notify_no_address(address or "")
         return None
-    
+
     normalized = _normalize_address(address)
     logger.info("BC scrape lookup_by_address normalized=%r", normalized)
 
     cached = cache_get(normalized)
     if cached is not None:
         logger.info("BC scrape SQLite cache hit for address=%r", address)
+        await record_cache_hit(address)
+        if not is_valid_assessment(cached):
+            notify_invalid_result(address, "Cached row missing total_value")
         return cached
 
     async with _scrape_lock:
         cached = cache_get(normalized)
         if cached is not None:
+            await record_cache_hit(address)
+            if not is_valid_assessment(cached):
+                notify_invalid_result(address, "Cached row missing total_value")
             return cached
 
         logger.info("BC scrape cache miss; scraping address=%r", address)
+        await record_bc_scrape(address)
         result = await _scrape_bcassessment(address.strip())
-        if result is not None:
-            cache_set(normalized, result)
+        if result is None:
+            notify_not_found(address)
+            return None
+        if not is_valid_assessment(result):
+            notify_invalid_result(address, "Scrape returned no total_value")
+            return None
+        cache_set(normalized, result)
         return result
 
 
