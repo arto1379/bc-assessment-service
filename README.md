@@ -265,9 +265,49 @@ Replace YOUR_LINUX_HOST with server IP or domain. If BlueNest runs in Docker on 
 
 
 
+-------
+#Probelm : Error
+
+There is one error related to playwrigth that after hours it got stocked and said no proeprty found. so oen of very temporary and easy solution is restart that so I created this
+
+
+I creatd **Timer unit** at  /etc/systemd/system/bc-assessment-restart.timer
+
+```bsh
+[Unit]
+Description=Daily restart of BC Assessment API
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+And then I created **Servcie Unit** at /etc/systemd/system/bc-assessment-restart.service
+
+```bsh
+[Unit]
+Description=Restart BC Assessment API (scheduled)
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart bc-assessment.service
+
+```
 
 
 
+So for enable and strat
+```bsh
+sudo systemctl daemon-reload
+sudo systemctl enable bc-assessment-restart.timer
+sudo systemctl start bc-assessment-restart.timer
+```
+
+for checking everytime it is need to see 
+```bsh
+sudo journalctl -u bc-assessment-restart.service -n 20
+sudo systemctl status bc-assessment
+```
 
 
 
