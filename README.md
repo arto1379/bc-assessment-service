@@ -275,9 +275,9 @@ I creatd **Timer unit** at  /etc/systemd/system/bc-assessment-restart.timer
 
 ```bsh
 [Unit]
-Description=Daily restart of BC Assessment API
+Description=Restart BC Assessment API every 2 hours
 [Timer]
-OnCalendar=*-*-* 02:00:00
+OnCalendar=*-*-* 00/2:00:00
 Persistent=true
 [Install]
 WantedBy=timers.target
@@ -317,4 +317,19 @@ final test
 ```bsh
 curl -G "http://getplutus.solutions/bc-assessment/address" \
 --data-urlencode "address=7009 TISDALL ST VANCOUVER"
+```
+
+
+check timer
+
+```bsh
+sudo systemctl status bc-assessment-restart.timer
+systemctl list-timers bc-assessment-restart.timer
+```
+
+
+or you can not wait and just easily
+
+```bsh
+sudo systemctl start bc-assessment-restart.service
 ```
