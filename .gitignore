@@ -8,3 +8,12 @@ data/
 .mypy_cache/
 playwright-report/
 test-results/
+
+# Secrets — never commit. `.env.example` is the committed template.
+.env
+.env.*
+!.env.example
+
+# Local tooling
+CLAUDE.md
+.claude/

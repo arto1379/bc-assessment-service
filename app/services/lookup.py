@@ -1,291 +1,262 @@
+"""Lookup orchestration: cache -> negative cache -> scrape -> classify -> record.
+
+Ordering note (this was the hang): the rate limiter is acquired *before* the
+scrape lock. Previously `bc_rate_limiter.acquire()` ran inside the lock, so
+hitting the hourly cap made one request sleep for up to an hour while holding
+the semaphore, blocking every other request behind it.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import hashlib
 import logging
 import re
 from typing import Optional
 
-from bs4 import BeautifulSoup
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    Route,
-    async_playwright,
-)
-
 from app.config import settings
+from app.db import failures
 from app.db.cache import cache_get, cache_set
-from app.schemas import AssessmentResult
+from app.schemas import AssessmentResult, FailureType, LookupOutcome
+from app.services.browser import browser_manager
 from app.services.rate_limit import bc_rate_limiter
+from app.services.scraper import BC_URL, scrape_address
 from app.services.stats import (
     is_valid_assessment,
-    notify_invalid_result,
+    notify_failure,
     notify_no_address,
     notify_not_found,
+    notify_recovered,
     record_bc_scrape,
     record_cache_hit,
 )
 
 logger = logging.getLogger(__name__)
 
-BC_URL = "https://www.bcassessment.ca/"
-SEARCH_SELECTOR = "#rsbSearch"
-AUTOCOMPLETE_SELECTOR = ".ui-autocomplete li"
-RESULT_READY_JS = (
-    "() => document.body && /Total value\\s*\\$?[\\d,]+/i.test(document.body.innerText)"
-)
-
-_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
-_BLOCKED_URL_RE = re.compile(
-    r"(google-analytics|googletagmanager|doubleclick|facebook|hotjar|clarity)",
-    re.I,
-)
-
-_playwright: Optional[Playwright] = None
-_browser: Optional[Browser] = None
-_context: Optional[BrowserContext] = None
-_page: Optional[Page] = None
-_browser_lock = asyncio.Lock()
 _scrape_lock = asyncio.Semaphore(1)
+_queue_depth = 0
+_queue_lock = asyncio.Lock()
 
 
 def _normalize_address(address: str) -> str:
     return re.sub(r"\s+", " ", address.strip().upper())
 
 
-def _clean(text: str | None) -> Optional[str]:
-    return re.sub(r"\s+", " ", text).strip() if text else None
+# ---------------------------------------------------------------------------
+# Mock provider (LOOKUP_PROVIDER=mock) — lets tests and local dev run the whole
+# request path without Playwright or any network access.
+# ---------------------------------------------------------------------------
 
 
-def _find_value_after_label(soup: BeautifulSoup, label: str) -> Optional[str]:
-    label_node = soup.find(string=re.compile(rf"^{re.escape(label)}$", re.I))
-    if not label_node:
-        return None
-
-    parent = label_node.find_parent()
-    if not parent:
-        return None
-
-    for sib in parent.find_next_siblings():
-        txt = _clean(sib.get_text(" "))
-        if txt:
-            return txt
-
-    row = parent.find_parent()
-    if row:
-        texts = [_clean(t) for t in row.stripped_strings]
-        texts = [t for t in texts if t]
-        if len(texts) >= 2:
-            return texts[-1]
-
-    return None
-
-
-def _find_total_value(soup: BeautifulSoup) -> Optional[str]:
-    text = soup.get_text(" ")
-    match = re.search(r"Total value\s*\$?([\d,]+)", text, re.I)
-    if match:
-        return "$" + match.group(1)
-    return None
-
-
-def _parse_html(html: str) -> AssessmentResult:
-    soup = BeautifulSoup(html, "html.parser")
-    return AssessmentResult(
-        total_value=_find_total_value(soup),
-        year_built=_find_value_after_label(soup, "Year built"),
-        number_of_bed=_find_value_after_label(soup, "Bedrooms"),
-        number_of_baths=_find_value_after_label(soup, "Baths"),
-        description=_find_value_after_label(soup, "Description"),
-        land_size=_find_value_after_label(soup, "Land size"),
-        strata_area=_find_value_after_label(soup, "Strata area"),
-        building_storeys=_find_value_after_label(soup, "Building storeys"),
-    )
-
-
-async def _route_handler(route: Route) -> None:
-    request = route.request
-    if request.resource_type in _BLOCKED_RESOURCE_TYPES:
-        await route.abort()
-        return
-    if _BLOCKED_URL_RE.search(request.url):
-        await route.abort()
-        return
-    await route.continue_()
-
-
-async def _get_browser() -> Browser:
-    global _playwright, _browser
-    async with _browser_lock:
-        if _browser is not None and _browser.is_connected():
-            return _browser
-
-        if _browser is not None:
-            await _browser.close()
-            _browser = None
-        if _playwright is not None:
-            await _playwright.stop()
-            _playwright = None
-
-        _playwright = await async_playwright().start()
-        _browser = await _playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+def _mock_lookup(address: str) -> LookupOutcome:
+    upper = address.upper()
+    if any(token in upper for token in ("NOWHERE", "INVALID", "DOESNOTEXIST")):
+        return LookupOutcome.failed(
+            FailureType.NOT_FOUND, "mock provider: unknown address", url=BC_URL
         )
-    return _browser
+    if "BLOCKED" in upper:
+        return LookupOutcome.failed(
+            FailureType.BLOCKED, "mock provider: simulated block", url=BC_URL
+        )
 
-
-async def _get_context() -> BrowserContext:
-    global _context
-    if _context is not None:
-        return _context
-
-    browser = await _get_browser()
-    _context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
+    # Derive a stable, address-specific value so tests can assert that two
+    # different addresses never return the same figures.
+    digest = int(hashlib.sha1(upper.encode()).hexdigest()[:6], 16)
+    return LookupOutcome.success(
+        AssessmentResult(
+            total_value=f"${500_000 + digest % 1_500_000:,}",
+            year_built=str(1950 + digest % 70),
+            number_of_bed=str(1 + digest % 5),
+            number_of_baths=str(1 + digest % 4),
+            description=None,
+            land_size=None,
+            strata_area=str(600 + digest % 2000),
+            building_storeys=str(1 + digest % 30),
+        )
     )
-    await _context.route("**/*", _route_handler)
-    return _context
 
 
-async def _get_page() -> Page:
-    global _page
-    if _page is not None and not _page.is_closed():
-        return _page
-
-    context = await _get_context()
-    _page = await context.new_page()
-    return _page
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
 
 
-async def _ensure_home(page: Page) -> None:
-    if await page.locator(SEARCH_SELECTOR).count() > 0:
+async def _scrape_once(address: str) -> LookupOutcome:
+    async with browser_manager.lookup_context() as (page, restarted):
+        return await scrape_address(page, address, restarted=restarted)
+
+
+async def _run_scrape(address: str) -> LookupOutcome:
+    """Rate-limit, then scrape under a hard timeout and a single-flight lock."""
+    global _queue_depth
+
+    max_depth = settings.scrape_max_queue_depth
+    async with _queue_lock:
+        if max_depth > 0 and _queue_depth >= max_depth:
+            logger.warning(
+                "Rejecting lookup for %r: %d requests already queued",
+                address,
+                _queue_depth,
+            )
+            return LookupOutcome.failed(
+                FailureType.BUSY,
+                f"{_queue_depth} lookups already queued; try again shortly",
+            )
+        _queue_depth += 1
+
+    try:
+        # Outside the scrape lock on purpose — see the module docstring.
+        await bc_rate_limiter.acquire()
+
+        async with _scrape_lock:
+            try:
+                return await asyncio.wait_for(
+                    _scrape_once(address),
+                    timeout=settings.scrape_total_timeout_ms / 1000,
+                )
+            except asyncio.TimeoutError:
+                # A lookup that blows the overall budget means the browser is
+                # in a bad state; force a relaunch before the next request.
+                browser_manager.request_restart("lookup exceeded total timeout")
+                return LookupOutcome.failed(
+                    FailureType.TIMEOUT,
+                    f"lookup exceeded {settings.scrape_total_timeout_ms}ms overall budget",
+                    step="total_timeout",
+                )
+            except Exception as exc:
+                logger.exception("Unexpected scrape failure for %r", address)
+                browser_manager.request_restart(f"unexpected error: {type(exc).__name__}")
+                return LookupOutcome.failed(
+                    FailureType.ERROR, f"{type(exc).__name__}: {exc}"
+                )
+    finally:
+        async with _queue_lock:
+            _queue_depth -= 1
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+async def lookup_by_address(address: str) -> LookupOutcome:
+    """Return assessment data for an address, or a classified failure."""
+    if not address or not address.strip():
+        logger.warning("lookup_by_address: empty address")
+        notify_no_address(address or "")
+        return LookupOutcome.failed(FailureType.NOT_FOUND, "empty address")
+
+    address = address.strip()
+    normalized = _normalize_address(address)
+    logger.info("lookup address=%r normalized=%r", address, normalized)
+
+    # 1. Positive cache.
+    cached = await asyncio.to_thread(cache_get, normalized)
+    if cached is not None and is_valid_assessment(cached):
+        logger.info("cache hit address=%r", normalized)
+        await record_cache_hit(address)
+        return LookupOutcome.success(cached)
+
+    # 2. Negative cache — a recent, genuine "not found".
+    negative = await asyncio.to_thread(failures.get_negative_cache, normalized)
+    if negative is not None:
+        logger.info("negative cache hit address=%r (%s)", normalized, negative)
+        await record_cache_hit(address)
+        return LookupOutcome.failed(FailureType.NOT_FOUND, negative)
+
+    # 3. Scrape. Counted before dispatch so the counter reflects every call that
+    # reached the provider, which is what the cache is meant to avoid.
+    await record_bc_scrape(address)
+    if settings.lookup_provider.lower() == "mock":
+        outcome = _mock_lookup(address)
+    else:
+        outcome = await _run_scrape(address)
+
+    await _record_outcome(address, normalized, outcome)
+    return outcome
+
+
+async def _record_outcome(
+    address: str, normalized: str, outcome: LookupOutcome
+) -> None:
+    """Persist and alert on the result of a scrape."""
+    if outcome.ok and outcome.result is not None:
+        browser_manager.record_success()
+        await asyncio.to_thread(cache_set, normalized, outcome.result)
+        await asyncio.to_thread(failures.mark_resolved, normalized)
+        await notify_recovered(address)
         return
-    await page.goto(BC_URL, wait_until="domcontentloaded", timeout=30_000)
-    await page.wait_for_selector(SEARCH_SELECTOR, state="visible", timeout=15_000)
+
+    failure = outcome.failure or FailureType.ERROR
+
+    # BUSY is a load-shedding signal, not a scraper fault: it says nothing about
+    # browser health and should not be queued for retry.
+    if failure is FailureType.BUSY:
+        logger.warning("lookup shed load for address=%r", address)
+        return
+
+    browser_manager.record_failure(failure)
+
+    await asyncio.to_thread(
+        failures.record_failure,
+        address,
+        normalized,
+        failure,
+        reason=outcome.reason,
+        step=outcome.step,
+        url=outcome.url,
+        snapshot_path=outcome.snapshot_path,
+    )
+
+    logger.warning(
+        "lookup failed address=%r type=%s step=%s url=%s reason=%s restarted=%s",
+        address,
+        failure.value,
+        outcome.step,
+        outcome.url,
+        outcome.reason,
+        outcome.restarted,
+    )
+
+    if failure is FailureType.NOT_FOUND:
+        notify_not_found(address)
+    else:
+        await notify_failure(address, outcome)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
 
 
 async def warmup_browser() -> None:
-    """Pre-load BC Assessment so the first API request is faster."""
+    """Pre-load the browser so the first API request is not slowed by launch."""
     if not settings.scrape_warmup_on_start:
         return
-    async with _scrape_lock:
-        await bc_rate_limiter.acquire()
-        page = await _get_page()
-        await _ensure_home(page)
-    logger.info("BC Assessment browser warmed up")
-
-
-async def _scrape_bcassessment(address: str) -> Optional[AssessmentResult]:
-    await bc_rate_limiter.acquire()
-
-    page = await _get_page()
-
+    if settings.lookup_provider.lower() == "mock":
+        return
     try:
-        await _ensure_home(page)
-
-        search = page.locator(SEARCH_SELECTOR)
-        logger.info("[1_SEARCH] BC scrape lookup_by_address search")
-        await search.click()
-        await search.fill("")
-        await search.fill(address)
-
-        logger.info("[2_fill] BC scrape lookup_by_address search")
-
-        await page.wait_for_selector(
-            AUTOCOMPLETE_SELECTOR,
-            state="visible",
-            timeout=settings.scrape_autocomplete_timeout_ms,
-        )
-        await page.locator(f"{AUTOCOMPLETE_SELECTOR}").first.click()
-
-        logger.info("[3_AUTOCOMPLETE] BC scrape lookup_by_address search")
-
-        await page.wait_for_function(
-            RESULT_READY_JS,
-            timeout=settings.scrape_result_timeout_ms,
-        )
-
-        logger.info("[4_GETTING_HTML] BC scrape lookup_by_address search")
-
-        html = await page.content()
-        result = _parse_html(html)
-
-        logger.info("[5_PARSING_HTML] BC scrape lookup_by_address search")
-
-        if not result.total_value:
-            logger.warning(
-                "BC scrape: no total_value for address=%r url=%s", address, page.url
-            )
-            return None
-
-        return result
-
-    except Exception as e:
-        logger.exception("BC scrape failed for address=%r: %s", address, e)
-        global _page
-        if _page is not None and not _page.is_closed():
-            await _page.close()
-        _page = None
-        return None
-
-
-async def lookup_by_address(address: str) -> Optional[AssessmentResult]:
-    """Return assessment data for an address, or None if not found."""
-    logger.info("BC scrape lookup_by_address address=%r", address)
-
-    if not address or not address.strip():
-        logger.warning("BC scrape lookup_by_address address is empty")
-        notify_no_address(address or "")
-        return None
-
-    normalized = _normalize_address(address)
-    logger.info("BC scrape lookup_by_address normalized=%r", normalized)
-
-    cached = cache_get(normalized)
-    if cached is not None:
-        logger.info("BC scrape SQLite cache hit for address=%r", address)
-        await record_cache_hit(address)
-        if not is_valid_assessment(cached):
-            notify_invalid_result(address, "Cached row missing total_value")
-        return cached
-
-    async with _scrape_lock:
-        cached = cache_get(normalized)
-        if cached is not None:
-            await record_cache_hit(address)
-            if not is_valid_assessment(cached):
-                notify_invalid_result(address, "Cached row missing total_value")
-            return cached
-
-        logger.info("BC scrape cache miss; scraping address=%r", address)
-        await record_bc_scrape(address)
-        result = await _scrape_bcassessment(address.strip())
-        if result is None:
-            notify_not_found(address)
-            return None
-        if not is_valid_assessment(result):
-            notify_invalid_result(address, "Scrape returned no total_value")
-            return None
-        cache_set(normalized, result)
-        return result
+        await browser_manager.ensure_browser()
+        logger.info("BC Assessment browser warmed up")
+    except Exception:
+        logger.exception("Browser warmup failed; will retry on first request")
 
 
 async def shutdown_browser() -> None:
-    global _playwright, _browser, _context, _page
-    async with _browser_lock:
-        if _page is not None and not _page.is_closed():
-            await _page.close()
-        _page = None
-        if _context is not None:
-            await _context.close()
-        _context = None
-        if _browser is not None:
-            await _browser.close()
-        _browser = None
-        if _playwright is not None:
-            await _playwright.stop()
-        _playwright = None
+    await browser_manager.shutdown()
+
+
+async def retry_failed_lookups(limit: int = 10) -> dict:
+    """Re-attempt queued failures whose backoff has elapsed."""
+    due = await asyncio.to_thread(
+        failures.list_failures, limit=limit, due_only=True
+    )
+    retried, recovered = 0, 0
+    for row in due:
+        if row["failure_type"] == FailureType.NOT_FOUND.value:
+            continue
+        retried += 1
+        outcome = await lookup_by_address(row["address"])
+        if outcome.ok:
+            recovered += 1
+    return {"due": len(due), "retried": retried, "recovered": recovered}

@@ -8,6 +8,10 @@ Run once before starting the API:
 Optional custom path:
 
     python scripts/setup_db.py /path/to/bc_assessment.db
+
+Safe to re-run: the schema is CREATE TABLE IF NOT EXISTS throughout, so this
+also acts as the migration that adds `failed_lookups` to an existing database
+without touching cached results.
 """
 
 from __future__ import annotations
@@ -17,41 +21,37 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DB = PROJECT_ROOT / "data" / "bc_assessment.db"
+sys.path.insert(0, str(PROJECT_ROOT))
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS assessment_cache (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    address TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    total_value TEXT,
-    year_built TEXT,
-    number_of_bed TEXT,
-    number_of_baths TEXT,
-    description TEXT,
-    land_size TEXT,
-    strata_area TEXT,
-    building_storeys TEXT,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_assessment_cache_address ON assessment_cache(address);
-"""
-
-
-def setup_database(db_path: Path) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
+from app.db.connection import db_path, init_db  # noqa: E402
 
 
 def main() -> None:
-    db_path = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else DEFAULT_DB
-    setup_database(db_path)
-    print(f"Cache database ready: {db_path}")
+    target = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else db_path()
+    existed = target.exists()
+    init_db(target)
+
+    conn = sqlite3.connect(target)
+    try:
+        tables = sorted(
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            )
+        )
+        cached = conn.execute("SELECT COUNT(*) FROM assessment_cache").fetchone()[0]
+        queued = conn.execute(
+            "SELECT COUNT(*) FROM failed_lookups WHERE resolved_at IS NULL"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    action = "migrated" if existed else "created"
+    print(f"Cache database {action}: {target}")
+    print(f"  tables: {', '.join(tables)}")
+    print(f"  cached addresses: {cached}")
+    print(f"  unresolved failures: {queued}")
 
 
 if __name__ == "__main__":

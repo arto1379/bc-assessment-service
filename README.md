@@ -1,10 +1,10 @@
 # BC Assessment API Service
-Small FastAPI service that exposes GET /address?address=... in the format expected by BlueNest’s BCAssessmentClient.
 
-What it does
-- Listens for: GET /address?address={formatted address}
-- Returns JSON like:
-```bsh
+FastAPI service exposing `GET /address?address=...` in the format expected by BlueNest's
+`BCAssessmentClient`. It checks a SQLite cache first and, on a miss, scrapes
+bcassessment.ca with Playwright and parses the page with BeautifulSoup.
+
+```json
 {
   "status": "success",
   "data": {
@@ -22,201 +22,231 @@ What it does
   }
 }
 ```
-Business logic lives in `lookup_by_address(address)` (`app/services/lookup.py`), which scrapes bcassessment.ca via Playwright.
 
---
+---
 
-##  Linux prerequisites
+## Root cause of the hang / false "Property not found"
 
-Install on the server (Ubuntu/Debian example):
+The service used to work after a restart and degrade within hours, which is why a systemd
+timer restarted it every 2 hours. **A restart only clears two things — process memory and
+the cookie jar — and that is exactly what was wrong.** Four defects compounded:
 
-```bsh
+### 1. The scraper never returned to a clean page
+
+```python
+async def _ensure_home(page):
+    if await page.locator("#rsbSearch").count() > 0:
+        return                       # result pages ALSO carry #rsbSearch
+    await page.goto(BC_URL, ...)
+```
+
+BC Assessment's *result* pages include the same `#rsbSearch` box in the header, so after
+the first successful lookup this check short-circuited forever and every later search ran
+from the previous property's page instead of the home page.
+
+### 2. That produced silently wrong data, not just hangs
+
+Readiness was detected with a text regex:
+
+```python
+"() => /Total value\\s*\\$?[\\d,]+/i.test(document.body.innerText)"
+```
+
+Because of defect 1 the DOM still displayed the **previous** property's "Total value $X".
+Clicking an autocomplete suggestion navigates asynchronously, so `wait_for_function`
+polled and the predicate was *already true from the stale page*. It returned immediately,
+`page.content()` captured the old property, and those numbers were cached under the new
+address. This is data corruption, and it is why some addresses returned plausible but
+incorrect values.
+
+### 3. The browser and context were never recycled
+
+The error path closed the `Page`, but the `BrowserContext` and `Browser` lived for the
+whole process. Cookies, storage and Chromium memory accumulated until BC's bot mitigation
+began serving a challenge page. From that moment `#rsbSearch` was absent, autocomplete
+never appeared, every lookup timed out, and every response became "Property not found" —
+permanently, until the next restart.
+
+### 4. The actual hang: rate-limit sleeps held the scrape lock
+
+`lookup_by_address` acquired `_scrape_lock`, and `_scrape_bcassessment` then called
+`await bc_rate_limiter.acquire()` **inside** it. On reaching the 500/hour cap, one request
+slept for up to an hour *while holding the semaphore*, blocking every queued request.
+There was also no ceiling on a whole lookup.
+
+### Why every failure looked identical
+
+`except Exception: return None` collapsed timeouts, challenge pages, network errors and
+genuinely unknown addresses into one `None`, which the API reported as
+`"Property not found"`. Nobody could tell the scraper was blocked.
+
+### Contributing factor found during this work
+
+`.env` on the server sets `SCRAPE_CACHE_TTL_SECONDS=3600`, so **every cached address was
+re-scraped hourly** even though BC Assessment data changes roughly once a year. That
+multiplied traffic to bcassessment.ca and materially increased the chance of being
+throttled. Set it to `0` (never expire) unless you have a reason not to.
+
+---
+
+## What changed
+
+| Area | Fix |
+|---|---|
+| **Page state** | A fresh `BrowserContext` + `Page` per lookup, always torn down. A clean context cannot carry stale markup or cookies, which removes defects 1 and 2 structurally rather than patching them. |
+| **Browser lifetime** | The browser process is reused but recycled after `BROWSER_MAX_LOOKUPS`, after `BROWSER_RESTART_AFTER_FAILURES` consecutive failures, or on disconnect. |
+| **Concurrency** | Rate limiting now happens *before* the scrape lock, so a capped-out sleep can no longer block queued requests. A queue-depth guard sheds load instead of hanging callers. |
+| **Timeouts** | Every lookup is wrapped in `SCRAPE_TOTAL_TIMEOUT_MS`; exceeding it forces a browser relaunch. |
+| **Failure taxonomy** | `not_found` / `blocked` / `timeout` / `parse_empty` / `error` / `busy`, surfaced as `error_type`. |
+| **Retry queue** | Failures go to a `failed_lookups` table with reason, step, URL, snapshot path, attempt count and exponential backoff. Invalid results are never written to the cache. |
+| **Alerts** | Blocking sends a Telegram alert with address, type, URL, reason, timestamp, restart status and a suggested action — de-duplicated so a block storm sends one message, plus an all-clear on recovery. |
+| **Health** | `/health` reports real scraper state and returns **503** when unhealthy. |
+| **Security** | The Telegram token is no longer hardcoded; `.env` is now gitignored. |
+
+The success response and the `"Property not found"` error are byte-for-byte unchanged.
+`error_type` is purely additive.
+
+### API surface
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /address?address=` | Unchanged contract, plus `error_type` on errors |
+| `GET /health` | Scraper health; 503 when unhealthy |
+| `GET /stats` | Counters, plus unresolved failures and cache size |
+| `GET /failures` | Inspect the retry queue (`?due_only=true`, `?include_resolved=true`) |
+| `POST /failures/retry` | Re-attempt failures whose backoff elapsed |
+
+Error responses:
+
+```json
+{ "status": "error", "message": "Property not found",            "error_type": "not_found" }
+{ "status": "error", "message": "Lookup temporarily unavailable", "error_type": "blocked" }
+{ "status": "error", "message": "Lookup timed out",               "error_type": "timeout" }
+```
+
+---
+
+## Setup
+
+### Linux prerequisites
+
+```bash
 sudo apt update
 sudo apt install -y python3 python3-pip python3-venv git curl
+sudo apt install -y nginx        # optional: reverse proxy
 ```
 
-Optional (production):
-```bsh
-sudo apt install -y nginx   # reverse proxy
-# or use Docker instead of bare metal
-```
+### Install
 
-check
-```bsh
-python3 --version
-```
-
-## Project Layout
-
-```bsh
-
-bc-assessment-service/
-├── README.md
-├── requirements.txt
-├── scripts/
-│   └── setup_db.py      # one-time SQLite cache setup
-├── data/                # SQLite DB (local only, do not commit)
-├── SCRAP/               # Python virtualenv (local only, do not commit)
-├── .env.example
-├── .env                 # local only, do not commit
-└── app/
-    ├── main.py          # FastAPI routes
-    ├── config.py        # host, port, database path
-    ├── schemas.py       # response models
-    ├── db/
-    │   └── cache.py     # SQLite cache read/write
-    └── services/
-        └── lookup.py    # lookup_by_address() — cache then scrape
-```
-
-
-# Quick start (Linux)
-###  Create project directory
-
-```bsh
-mkdir -p bc-assessment-service/app/services
-cd bc-assessment-service
-```
-
-or get from github
-```
-git clone ......
-cd /root/bc-assessment-service
-
-
-```
-
-
-### Create virtual environment (`SCRAP`)
-
-```bsh
+```bash
+git clone <repo> && cd bc-assessment-service
 python3 -m venv SCRAP
 source SCRAP/bin/activate
-```
-
-Deactivate when done: `deactivate`
-
-### Install dependencies
-
-```bsh
 pip install -r requirements.txt
 playwright install chromium
-```
-in linux is better to run 
-```bsh
 playwright install-deps chromium
 ```
 
-if fails try :
-```bsh
+If `install-deps` fails:
+
+```bash
 sudo apt install -y libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 libasound2
 ```
 
+### Configure
 
-### Environment variables
-in `.env.example`:
-```bsh
-HOST=0.0.0.0
-PORT=8011
-DATABASE_PATH=data/bc_assessment.db
-SCRAPE_CACHE_TTL_SECONDS=0
-```
-copy and edit:<br>
-```bsh
+```bash
 cp .env.example .env
 ```
 
-### One-time database setup (SQLite cache)
+Then edit `.env`. **`.env` is gitignored — never commit it.**
 
-Run once before the first server start:
+### Database
 
-```bsh
+```bash
 python scripts/setup_db.py
 ```
 
-This creates `data/bc_assessment.db` with an `assessment_cache` table (`id`, `address`, assessment fields, `created_at`). Every lookup checks this cache first; on a miss it scrapes bcassessment.ca and stores the result. BC Assessment data changes about once per year, so the default TTL is `0` (never expire).
+Creates `assessment_cache` and `failed_lookups`. Safe to re-run: it is also the migration
+that adds `failed_lookups` to an existing database without touching cached results.
 
-### run the server
-
-Using `.env` for host/port (see `.env.example`):
-
-```bsh
-python -m app.main
-```
-
-Or with uvicorn directly:
-
-```bsh
-uvicorn app.main:app --host 0.0.0.0 --port 8011 --reload
-```
-
-Api is accessible by http://localhost:8011/address?address=..
-
-Docds http://localhost:8011/docs
-
-
-### test 
-```bsh
-curl -G "http://localhost:8011/address" \
-  --data-urlencode "address=7009 TISDALL ST VANCOUVER"
-```
-
-The first request after startup may take ~10–20s (browser warmup). Repeat lookups for the same address are instant (SQLite cache). New addresses are typically faster than before (~8–15s) because the scraper reuses one browser tab and skips slow `networkidle` waits.
-
-### Performance tuning (optional `.env`)
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `DATABASE_PATH` | `data/bc_assessment.db` | SQLite cache file path |
-| `SCRAPE_CACHE_TTL_SECONDS` | `0` | Cache entry lifetime in seconds (`0` = never expire) |
-| `BC_RATE_LIMIT_MAX` | `15` | Short-term max scrapes per window (`0` = disable tier) |
-| `BC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Short-term window in seconds |
-| `BC_RATE_LIMIT_HOURLY_MAX` | `500` | Hourly max scrapes (`0` = disable tier) |
-| `BC_RATE_LIMIT_HOURLY_WINDOW_SECONDS` | `3600` | Hourly window in seconds (1 hour) |
-| `BC_RATE_LIMIT_MIN_INTERVAL_SECONDS` | `4` | Minimum seconds between BC requests (`0` = disable) |
-| `SCRAPE_WARMUP_ON_START` | `true` | Pre-load bcassessment.ca when the server starts |
-| `SCRAPE_AUTOCOMPLETE_TIMEOUT_MS` | `8000` | Max wait for search suggestions |
-| `SCRAPE_RESULT_TIMEOUT_MS` | `25000` | Max wait for property page content |
-| `TELEGRAM_BOT_TOKEN` | _(empty)_ | Bot token from [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_CHAT_IDS` | _(empty)_ | Comma-separated chat IDs, e.g. `6985166589,109329798` |
-| `STATS_MILESTONE_COUNT` | `100` | Reset counters and alert when cache or BC hits reach this |
-
-Copy from `.env.example` into `.env` to override.
-
-### Telegram alerts
-
-Add to `.env` (do **not** commit the real token):
+### Run
 
 ```bash
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_IDS=6985166589,109329798
-STATS_MILESTONE_COUNT=100
+python -m app.main
+# or
+uvicorn app.main:app --host 0.0.0.0 --port 8011
 ```
 
-In-memory counters track cache hits and BC scrapes. When **either** reaches `STATS_MILESTONE_COUNT`, both counters reset and both chat IDs get a summary message.
+---
 
-Immediate alerts are sent for:
+## Environment variables
 
-- Empty / whitespace address
-- Property not found
-- Invalid result (e.g. missing `total_value`)
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOST` / `PORT` | `0.0.0.0` / `8011` | Bind address |
+| `LOOKUP_PROVIDER` | `live` | `live` scrapes BC; `mock` serves fixtures (tests) |
+| `DATABASE_PATH` | `data/bc_assessment.db` | SQLite file |
+| `SCRAPE_CACHE_TTL_SECONDS` | `0` | Cache lifetime; `0` = never expire (**recommended**) |
+| `NOT_FOUND_CACHE_TTL_SECONDS` | `86400` | How long a genuine not-found is remembered |
+| `BC_RATE_LIMIT_MAX` | `15` | Max scrapes per short window |
+| `BC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Short window |
+| `BC_RATE_LIMIT_HOURLY_MAX` | `500` | Hourly cap |
+| `BC_RATE_LIMIT_MIN_INTERVAL_SECONDS` | `4` | Minimum spacing between BC requests |
+| `SCRAPE_WARMUP_ON_START` | `true` | Pre-launch the browser at boot |
+| `SCRAPE_AUTOCOMPLETE_TIMEOUT_MS` | `8000` | Wait for suggestions |
+| `SCRAPE_RESULT_TIMEOUT_MS` | `25000` | Wait for the property page |
+| `SCRAPE_TOTAL_TIMEOUT_MS` | `60000` | Ceiling on one whole lookup |
+| `SCRAPE_MAX_QUEUE_DEPTH` | `20` | Queued requests before shedding load |
+| `BROWSER_MAX_LOOKUPS` | `200` | Recycle the browser after N lookups (`0` = never) |
+| `BROWSER_RESTART_AFTER_FAILURES` | `3` | Recycle after N consecutive failures |
+| `UNHEALTHY_AFTER_FAILURES` | `5` | Failures before `/health` returns 503 |
+| `SAVE_HTML_SNAPSHOTS` | `true` | Save HTML for blocked/unexpected pages |
+| `SNAPSHOT_DIR` / `SNAPSHOT_KEEP` | `data/snapshots` / `50` | Snapshot location and retention |
+| `TELEGRAM_BOT_TOKEN` | _(empty)_ | From [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_CHAT_IDS` | _(empty)_ | Comma-separated chat IDs |
+| `STATS_MILESTONE_COUNT` | `100` | Reset counters and alert at this many calls |
+| `ALERT_MIN_INTERVAL_SECONDS` | `300` | Minimum gap between repeat alerts of one type |
 
-Check live counts: `GET /stats` → `{"cache_calls": 12, "bc_calls": 3}`
+> **Alerts require configuration now.** The bot token used to be a hardcoded default in
+> `app/config.py`. It has been removed, so Telegram alerts stay silent until
+> `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_IDS` are set in `.env`.
 
+---
 
+## Testing
 
-
-
-## Production on Linux 
-Example unit file /etc/systemd/system/bc-assessment.service:
-
-```bsh
-cd /etc/systemd/system/
-vim bc-assessment.service
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
+56 tests covering parsing, block detection, cache behaviour (including that invalid
+results are never cached), the retry queue and negative cache, browser recycling policy,
+alert de-duplication, and the full API surface. They run against the `mock` provider, so
+no browser and no network are required.
 
-```bsh
+### Load / reproduction harness
+
+```bash
+python scripts/load_test.py --base-url http://localhost:8011 --mode all
+python scripts/load_test.py --mode stale        # stale-result regression check
+python scripts/load_test.py --mode soak --duration 14400   # 4-hour soak
+```
+
+Modes: `unique`, `cache`, `unknown`, `malformed`, `concurrent`, `stale`, `soak`, `all`.
+It reports latency percentiles and an outcome breakdown.
+
+`--mode stale` is the direct regression test for defect 2: it asserts that distinct
+addresses never return the same `total_value`.
+
+---
+
+## Production (systemd)
+
+`/etc/systemd/system/bc-assessment.service`:
+
+```ini
 [Unit]
 Description=BC Assessment API
 After=network.target
@@ -232,104 +262,66 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-
 ```
 
-Enable and start 
-
-```bsh
+```bash
 sudo systemctl daemon-reload
-sudo systemctl enable bc-assessment
-sudo systemctl start bc-assessment
+sudo systemctl enable --now bc-assessment
 sudo systemctl status bc-assessment
-
 ```
 
+### Removing the 2-hour restart timer
 
+The timer was a workaround for the defects above and is no longer the fix. After
+deploying and soaking successfully:
 
+```bash
+sudo systemctl disable --now bc-assessment-restart.timer
+systemctl list-timers | grep bc-assessment    # should be empty
+```
 
+`Restart=always` remains, so the service still recovers from a genuine crash.
 
+### Operating
 
+```bash
+sudo journalctl -u bc-assessment -f            # logs
+curl localhost:8011/health                     # scraper health (503 = unhealthy)
+curl localhost:8011/failures                   # retry queue
+curl -X POST localhost:8011/failures/retry     # retry what is due
+sudo systemctl restart bc-assessment           # restart
+```
 
-----
-# Connect BlueNest
-In BlueNest backend .env:
+Every failure logs address, failure type, step, URL and reason, so a bad lookup can be
+traced without reproducing it.
 
-```bsh
-BC_ASSESSMENT_API_URL=http://YOUR_LINUX_HOST:8011/address
+---
+
+## Connecting BlueNest
+
+```bash
+BC_ASSESSMENT_API_URL=http://YOUR_HOST:8011/address
 BC_ASSESSMENT_TIMEOUT=30
 ```
 
-Replace YOUR_LINUX_HOST with server IP or domain. If BlueNest runs in Docker on the same machine, use http://host.docker.internal:8011/address (Mac/Windows) or the Docker network hostname on Linux.
+Production check:
 
-
-
-
--------
-#Probelm : Error
-
-There is one error related to playwrigth that after hours it got stocked and said no proeprty found. so oen of very temporary and easy solution is restart that so I created this
-
-
-I creatd **Timer unit** at  /etc/systemd/system/bc-assessment-restart.timer
-
-```bsh
-[Unit]
-Description=Restart BC Assessment API every 2 hours
-[Timer]
-OnCalendar=*-*-* 00/2:00:00
-Persistent=true
-[Install]
-WantedBy=timers.target
-```
-
-And then I created **Servcie Unit** at /etc/systemd/system/bc-assessment-restart.service
-
-```bsh
-[Unit]
-Description=Restart BC Assessment API (scheduled)
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/systemctl restart bc-assessment.service
-
-```
-
-
-
-So for enable and strat
-```bsh
-sudo systemctl daemon-reload
-sudo systemctl enable bc-assessment-restart.timer
-sudo systemctl start bc-assessment-restart.timer
-```
-
-for checking everytime it is need to see 
-```bsh
-sudo journalctl -u bc-assessment-restart.service -n 20
-sudo systemctl status bc-assessment
-```
-
-
-
-
-final test
-
-```bsh
+```bash
 curl -G "http://getplutus.solutions/bc-assessment/address" \
---data-urlencode "address=7009 TISDALL ST VANCOUVER"
+  --data-urlencode "address=7009 TISDALL ST VANCOUVER"
 ```
 
+---
 
-check timer
+## Known limitations
 
-```bsh
-sudo systemctl status bc-assessment-restart.timer
-systemctl list-timers bc-assessment-restart.timer
-```
-
-
-or you can not wait and just easily
-
-```bsh
-sudo systemctl start bc-assessment-restart.service
-```
+- Scraping remains single-flight (`Semaphore(1)`) by design, to avoid overloading BC
+  Assessment. Throughput is bounded by `BC_RATE_LIMIT_MIN_INTERVAL_SECONDS`.
+- A fresh context per lookup costs roughly 200–400 ms, which is negligible against the 4 s
+  minimum request spacing and buys correctness.
+- Playwright is still used for every live lookup. An httpx fast path was considered and
+  deliberately deferred: the PRD requires that optimization never reduce reliability, and
+  the rate-limit floor means it would save little in practice.
+- `not_found` classification is heuristic — if BC's autocomplete returns nothing while the
+  page is otherwise healthy, the address is treated as unknown. Genuine blocks are caught
+  by explicit marker/status detection first.
