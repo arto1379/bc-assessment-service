@@ -8,6 +8,17 @@ import pytest
 from app.config import settings
 from app.db import connection
 from app.services import stats
+from app.services.browser import BrowserHealth, browser_manager
+
+
+@pytest.fixture(autouse=True)
+def fresh_browser_health():
+    """`browser_manager` is a module-level singleton, so failure counts recorded
+    by one test would otherwise leak into the next one's `/health`."""
+    browser_manager._health = BrowserHealth()
+    browser_manager._restart_pending = False
+    browser_manager._restart_reason = None
+    yield
 
 
 @pytest.fixture(autouse=True)

@@ -103,6 +103,57 @@ class TestHealthState:
         assert snapshot["last_failure_at"] is not None
 
 
+class TestNotFoundIsNotAScraperFault:
+    """A genuine not-found is the caller's address, not a sick scraper.
+
+    Counting it as a browser failure meant a run of unknown addresses — entirely
+    normal traffic — drove `/health` to 503 and relaunched Chromium every few
+    lookups. A monitor reacting to that 503 would restart the service, which is
+    the restart loop this work exists to remove.
+    """
+
+    def test_unknown_addresses_do_not_make_the_service_unhealthy(self, monkeypatch):
+        monkeypatch.setattr(settings, "unhealthy_after_failures", 5)
+        manager = make_manager()
+
+        for _ in range(10):
+            manager.record_failure(FailureType.NOT_FOUND)
+
+        assert manager.is_healthy is True
+        assert manager.health.consecutive_failures == 0
+
+    def test_unknown_addresses_do_not_force_a_browser_relaunch(self, monkeypatch):
+        monkeypatch.setattr(settings, "browser_restart_after_failures", 3)
+        manager = make_manager()
+
+        for _ in range(5):
+            manager.record_failure(FailureType.NOT_FOUND)
+
+        assert manager._needs_restart()[0] is False
+
+    def test_not_found_still_counts_toward_the_recycle_budget(self, monkeypatch):
+        """The lookup did use the browser, so it must not extend its lifetime."""
+        monkeypatch.setattr(settings, "browser_max_lookups", 4)
+        manager = make_manager()
+
+        for _ in range(4):
+            manager.record_failure(FailureType.NOT_FOUND)
+
+        needs, reason = manager._needs_restart()
+        assert needs is True and "4 lookups" in reason
+
+    def test_real_scraper_faults_still_count(self, monkeypatch):
+        """The guard must not blunt detection of genuine trouble."""
+        monkeypatch.setattr(settings, "unhealthy_after_failures", 3)
+        manager = make_manager()
+
+        manager.record_failure(FailureType.NOT_FOUND)
+        for _ in range(3):
+            manager.record_failure(FailureType.BLOCKED)
+
+        assert manager.is_healthy is False
+
+
 class TestAlertDeduplication:
     async def test_repeat_alerts_of_one_type_are_suppressed(self, monkeypatch):
         sent: list[str] = []

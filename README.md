@@ -95,7 +95,7 @@ throttled. Set it to `0` (never expire) unless you have a reason not to.
 |---|---|
 | **Page state** | A fresh `BrowserContext` + `Page` per lookup, always torn down. A clean context cannot carry stale markup or cookies, which removes defects 1 and 2 structurally rather than patching them. |
 | **Browser lifetime** | The browser process is reused but recycled after `BROWSER_MAX_LOOKUPS`, after `BROWSER_RESTART_AFTER_FAILURES` consecutive failures, or on disconnect. |
-| **Concurrency** | Rate limiting now happens *before* the scrape lock, so a capped-out sleep can no longer block queued requests. A queue-depth guard sheds load instead of hanging callers. |
+| **Concurrency** | Rate limiting happens *before* the scrape lock, so a capped-out sleep no longer holds the semaphore. A queue-depth guard sheds load with `busy` instead of hanging callers, and `SCRAPE_TOTAL_TIMEOUT_MS` caps any single scrape. Those last two are what actually stop a wedge — see the caveat below. |
 | **Timeouts** | Every lookup is wrapped in `SCRAPE_TOTAL_TIMEOUT_MS`; exceeding it forces a browser relaunch. |
 | **Failure taxonomy** | `not_found` / `blocked` / `timeout` / `parse_empty` / `error` / `busy`, surfaced as `error_type`. |
 | **Retry queue** | Failures go to a `failed_lookups` table with reason, step, URL, snapshot path, attempt count and exponential backoff. Invalid results are never written to the cache. |
@@ -221,10 +221,15 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-56 tests covering parsing, block detection, cache behaviour (including that invalid
+70 tests covering parsing, block detection, cache behaviour (including that invalid
 results are never cached), the retry queue and negative cache, browser recycling policy,
 alert de-duplication, and the full API surface. They run against the `mock` provider, so
 no browser and no network are required.
+
+`tests/test_concurrency.py` is worth calling out: `lookup_by_address` branches to the mock
+provider *before* `_run_scrape`, so the queue guard, the total-timeout ceiling and the
+rate limiter get no coverage from the rest of the suite — nor from `load_test.py` run
+against a mock server. Those tests drive `_run_scrape` directly with a stubbed scrape.
 
 ### Load / reproduction harness
 
@@ -317,6 +322,13 @@ curl -G "http://getplutus.solutions/bc-assessment/address" \
 
 - Scraping remains single-flight (`Semaphore(1)`) by design, to avoid overloading BC
   Assessment. Throughput is bounded by `BC_RATE_LIMIT_MIN_INTERVAL_SECONDS`.
+- **A capped-out rate-limit wait is not bounded.** `BCRateLimiter.acquire()` sleeps inside
+  its own `asyncio.Lock`, so waiters still serialise — moving it outside `_scrape_lock`
+  changed *which* lock they queue on, not that they queue. And because `acquire()` sits
+  outside the `asyncio.wait_for` in `_run_scrape`, `SCRAPE_TOTAL_TIMEOUT_MS` does not cover
+  it: at the hourly cap a request can block for up to an hour. Callers beyond
+  `SCRAPE_MAX_QUEUE_DEPTH` at least get a fast `busy` rather than hanging. Returning `busy`
+  once the projected wait exceeds a threshold would be the real fix.
 - A fresh context per lookup costs roughly 200–400 ms, which is negligible against the 4 s
   minimum request spacing and buys correctness.
 - Playwright is still used for every live lookup. An httpx fast path was considered and

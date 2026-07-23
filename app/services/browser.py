@@ -124,12 +124,22 @@ class BrowserManager:
         self._health.lookups_since_browser_launch += 1
 
     def record_failure(self, failure: FailureType) -> None:
-        self._health.consecutive_failures += 1
         self._health.last_failure_at = _now_iso()
         self._health.last_failure_type = failure.value
+        # The lookup still used the browser, so it counts toward the recycle
+        # budget regardless of why it failed.
         self._health.total_lookups += 1
         self._health.lookups_since_browser_launch += 1
 
+        # A genuine NOT_FOUND says the caller's address does not exist, not that
+        # the scraper is sick. Counting it here drove /health to 503 and forced a
+        # Chromium relaunch on ordinary traffic — a run of unknown addresses is
+        # normal, and a monitor reacting to that 503 would restart the service,
+        # reintroducing the restart loop this work removed.
+        if not failure.is_scraper_fault:
+            return
+
+        self._health.consecutive_failures += 1
         if self._health.consecutive_failures >= settings.browser_restart_after_failures:
             self.request_restart(
                 f"{self._health.consecutive_failures} consecutive failures"

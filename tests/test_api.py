@@ -128,6 +128,31 @@ class TestOperationalEndpoints:
         assert "cache_calls" in body
         assert "bc_calls" in body
 
+    def test_a_run_of_unknown_addresses_keeps_the_service_healthy(self, client):
+        """End-to-end guard: unknown addresses are normal traffic, not an outage.
+
+        These used to count as browser failures, so five of them returned 503
+        from /health — and anything watching that endpoint would have restarted
+        a perfectly healthy service.
+        """
+        for i in range(5):
+            response = client.get("/address", params={"address": f"NOWHERE {i} ST"})
+            assert response.json()["error_type"] == "not_found"
+
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["ok"] is True
+
+    def test_repeated_scraper_faults_do_report_unhealthy(self, client, monkeypatch):
+        """The counterpart: real faults must still surface as 503."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "unhealthy_after_failures", 3)
+        for i in range(3):
+            client.get("/address", params={"address": f"BLOCKED {i} ST"})
+
+        assert client.get("/health").status_code == 503
+
     def test_failures_endpoint_lists_the_queue(self, client):
         client.get("/address", params={"address": "BLOCKED ST VANCOUVER"})
         body = client.get("/failures").json()
