@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the BC Assessment Service Works</title>
+<meta name="description" content="A file-by-file, function-by-function walkthrough of the BC Assessment scraping service.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128269;</text></svg>">
+</head>
+<body>
+<style>
+  :root {
+    --bg: #eef1f5;
+    --surface: #ffffff;
+    --surface-2: #f6f8fb;
+    --ink: #16202b;
+    --ink-muted: #55636f;
+    --ink-faint: #8090a0;
+    --border: #d9e0e8;
+    --border-strong: #c3ccd6;
+    --accent: #1b5e8c;
+    --accent-ink: #124667;
+    --bug: #b23a2e;
+    --bug-soft: #f7e8e5;
+    --bug-line: #dfa89f;
+    --fix: #1c7a52;
+    --fix-soft: #e3f1e9;
+    --fix-line: #9bcbb2;
+    --inv: #1b5e8c;
+    --inv-soft: #e6eef5;
+    --inv-line: #a9c4d8;
+    /* code panel is a constant "terminal" in both themes */
+    --code-bg: #0f151c;
+    --code-panel: #131b24;
+    --code-ink: #d6dee8;
+    --code-comment: #6f8091;
+    --code-key: #7fb0d8;
+    --code-str: #9ecf9e;
+    --code-border: #223040;
+    --shadow: 0 1px 2px rgba(20,32,43,.05), 0 8px 24px rgba(20,32,43,.06);
+
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f14;
+      --surface: #111721;
+      --surface-2: #0e141c;
+      --ink: #e2e9f1;
+      --ink-muted: #9aa7b6;
+      --ink-faint: #6a7887;
+      --border: #212b37;
+      --border-strong: #2c3745;
+      --accent: #5aa6dc;
+      --accent-ink: #8ec5ec;
+      --bug: #e08476;
+      --bug-soft: rgba(178,58,46,.14);
+      --bug-line: rgba(224,132,118,.5);
+      --fix: #5fbe93;
+      --fix-soft: rgba(28,122,82,.15);
+      --fix-line: rgba(95,190,147,.45);
+      --inv: #5aa6dc;
+      --inv-soft: rgba(90,166,220,.13);
+      --inv-line: rgba(90,166,220,.4);
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #eef1f5; --surface: #ffffff; --surface-2: #f6f8fb;
+    --ink: #16202b; --ink-muted: #55636f; --ink-faint: #8090a0;
+    --border: #d9e0e8; --border-strong: #c3ccd6;
+    --accent: #1b5e8c; --accent-ink: #124667;
+    --bug: #b23a2e; --bug-soft: #f7e8e5; --bug-line: #dfa89f;
+    --fix: #1c7a52; --fix-soft: #e3f1e9; --fix-line: #9bcbb2;
+    --inv: #1b5e8c; --inv-soft: #e6eef5; --inv-line: #a9c4d8;
+    --shadow: 0 1px 2px rgba(20,32,43,.05), 0 8px 24px rgba(20,32,43,.06);
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0f14; --surface: #111721; --surface-2: #0e141c;
+    --ink: #e2e9f1; --ink-muted: #9aa7b6; --ink-faint: #6a7887;
+    --border: #212b37; --border-strong: #2c3745;
+    --accent: #5aa6dc; --accent-ink: #8ec5ec;
+    --bug: #e08476; --bug-soft: rgba(178,58,46,.14); --bug-line: rgba(224,132,118,.5);
+    --fix: #5fbe93; --fix-soft: rgba(28,122,82,.15); --fix-line: rgba(95,190,147,.45);
+    --inv: #5aa6dc; --inv-soft: rgba(90,166,220,.13); --inv-line: rgba(90,166,220,.4);
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body { margin: 0; }
+
+  .page {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  .progress {
+    position: fixed; top: 0; left: 0; height: 3px; width: 0%;
+    background: var(--accent); z-index: 60; transition: width .1s linear;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 264px minmax(0, 1fr);
+    gap: 0;
+    max-width: 1240px;
+    margin: 0 auto;
+  }
+
+  /* ---------- sidebar ---------- */
+  .sidebar {
+    position: sticky; top: 0; align-self: start;
+    height: 100vh; overflow-y: auto;
+    padding: 2rem 1.25rem 3rem 1.5rem;
+    border-right: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: baseline; gap: .5rem; margin-bottom: 1.5rem; }
+  .brand .dot { width: 10px; height: 10px; border-radius: 2px; background: var(--accent); transform: translateY(-1px); }
+  .brand b { font-family: var(--mono); font-size: .82rem; letter-spacing: .02em; color: var(--ink); }
+  .toc { list-style: none; margin: 0; padding: 0; }
+  .toc .group { font-family: var(--mono); font-size: .68rem; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); margin: 1.4rem 0 .5rem; }
+  .toc .group:first-child { margin-top: 0; }
+  .toc a {
+    display: block; padding: .28rem .55rem; margin: 1px 0;
+    color: var(--ink-muted); text-decoration: none;
+    font-size: .86rem; border-radius: 5px; border-left: 2px solid transparent;
+    transition: color .15s, background .15s, border-color .15s;
+  }
+  .toc a code { font-family: var(--mono); font-size: .82em; }
+  .toc a:hover { color: var(--ink); background: var(--surface-2); }
+  .toc a.active { color: var(--accent); background: var(--inv-soft); border-left-color: var(--accent); font-weight: 600; }
+
+  /* ---------- content ---------- */
+  .content { padding: 3rem clamp(1.1rem, 4vw, 3.5rem) 6rem; min-width: 0; }
+  section { scroll-margin-top: 1.5rem; }
+
+  .eyebrow { font-family: var(--mono); font-size: .72rem; letter-spacing: .18em; text-transform: uppercase; color: var(--accent); margin: 0 0 .6rem; }
+
+  h1 { font-family: var(--serif); font-weight: 600; font-size: clamp(2.3rem, 5vw, 3.5rem); line-height: 1.05; letter-spacing: -.01em; margin: 0 0 1rem; text-wrap: balance; }
+  h2 { font-family: var(--serif); font-weight: 600; font-size: clamp(1.6rem, 3.2vw, 2.15rem); line-height: 1.12; letter-spacing: -.01em; margin: 0; text-wrap: balance; }
+  h3 { font-family: var(--serif); font-weight: 600; font-size: 1.35rem; margin: 2.4rem 0 .5rem; }
+  .lead { font-size: 1.18rem; line-height: 1.6; color: var(--ink-muted); max-width: 66ch; margin: 0 0 1.5rem; }
+  p { max-width: 68ch; }
+  a.inl { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--inv-line); }
+  a.inl:hover { border-color: var(--accent); }
+
+  .hero { padding-bottom: 2.5rem; margin-bottom: 2.5rem; border-bottom: 1px solid var(--border); }
+  .hero-meta { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1.5rem; }
+  .chip { font-family: var(--mono); font-size: .74rem; padding: .3rem .6rem; border: 1px solid var(--border-strong); border-radius: 100px; color: var(--ink-muted); background: var(--surface); }
+
+  /* file section header */
+  .filehead { margin: 4.5rem 0 1.5rem; padding-top: 1.5rem; border-top: 2px solid var(--border-strong); }
+  .filehead:first-of-type { margin-top: 1rem; }
+  .filehead .path { font-family: var(--mono); font-size: 1.15rem; color: var(--ink); font-weight: 600; display: inline-flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+  .filehead .path .tag { font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); background: var(--inv-soft); padding: .18rem .5rem; border-radius: 4px; font-weight: 600; }
+  .filehead .role { color: var(--ink-muted); font-size: 1.02rem; margin: .5rem 0 0; max-width: 70ch; }
+
+  /* function subsection */
+  .fn { margin: 1.75rem 0; }
+  .fn-sig { font-family: var(--mono); font-size: .95rem; font-weight: 600; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: .5rem .75rem; margin: 0 0 .75rem; overflow-x: auto; white-space: nowrap; }
+  .fn p { margin: .5rem 0; }
+  .label { font-family: var(--mono); font-size: .7rem; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); font-weight: 700; }
+
+  /* code */
+  pre.code { background: var(--code-bg); color: var(--code-ink); border: 1px solid var(--code-border); border-radius: 8px; padding: 1rem 1.1rem; overflow-x: auto; font-family: var(--mono); font-size: .82rem; line-height: 1.6; margin: .75rem 0; box-shadow: var(--shadow); }
+  pre.code .c { color: var(--code-comment); font-style: italic; }
+  pre.code .k { color: var(--code-key); }
+  pre.code .s { color: var(--code-str); }
+  code.ic { font-family: var(--mono); font-size: .88em; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: .05rem .35rem; color: var(--accent-ink); }
+  @media (prefers-color-scheme: dark) { code.ic { color: var(--accent); } }
+  :root[data-theme="dark"] code.ic { color: var(--accent); }
+
+  /* callouts */
+  .note { border-radius: 8px; padding: .85rem 1rem .85rem 1.1rem; margin: 1rem 0; border: 1px solid var(--border); border-left: 4px solid var(--accent); background: var(--surface); font-size: .95rem; }
+  .note p { margin: .35rem 0; max-width: none; }
+  .note .nt { display: block; font-family: var(--mono); font-size: .7rem; letter-spacing: .1em; text-transform: uppercase; font-weight: 700; margin-bottom: .3rem; }
+  .note.bug { background: var(--bug-soft); border-color: var(--bug-line); border-left-color: var(--bug); }
+  .note.bug .nt { color: var(--bug); }
+  .note.fix { background: var(--fix-soft); border-color: var(--fix-line); border-left-color: var(--fix); }
+  .note.fix .nt { color: var(--fix); }
+  .note.inv { background: var(--inv-soft); border-color: var(--inv-line); border-left-color: var(--inv); }
+  .note.inv .nt { color: var(--inv); }
+
+  /* legend */
+  .legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: .75rem; margin: 1.5rem 0 0; }
+  .legend .item { border: 1px solid var(--border); border-radius: 8px; padding: .75rem .85rem; background: var(--surface); }
+  .legend .item .sw { display: inline-block; width: 26px; height: 8px; border-radius: 3px; margin-bottom: .4rem; }
+  .legend .item b { font-size: .88rem; }
+  .legend .item span { display: block; color: var(--ink-muted); font-size: .82rem; }
+
+  /* pipeline */
+  .pipe { counter-reset: step; margin: 1.5rem 0 0; display: flex; flex-direction: column; gap: 0; }
+  .pipe .step { position: relative; padding: 0 0 1.5rem 3.25rem; }
+  .pipe .step:before { counter-increment: step; content: counter(step); position: absolute; left: 0; top: 0; width: 2rem; height: 2rem; border-radius: 50%; background: var(--surface); border: 2px solid var(--accent); color: var(--accent); font-family: var(--mono); font-weight: 700; font-size: .85rem; display: grid; place-items: center; z-index: 2; }
+  .pipe .step:after { content: ""; position: absolute; left: calc(1rem - 1px); top: 2rem; bottom: 0; width: 2px; background: var(--border-strong); }
+  .pipe .step:last-child { padding-bottom: 0; }
+  .pipe .step:last-child:after { display: none; }
+  .pipe .step h4 { margin: .2rem 0 .25rem; font-size: 1rem; font-family: var(--sans); }
+  .pipe .step h4 code { font-family: var(--mono); font-size: .82em; color: var(--accent); }
+  .pipe .step p { margin: 0; color: var(--ink-muted); font-size: .92rem; max-width: 62ch; }
+
+  /* table */
+  .tablewrap { overflow-x: auto; margin: 1.25rem 0; border: 1px solid var(--border); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-family: var(--mono); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); background: var(--surface-2); }
+  tr:last-child td { border-bottom: none; }
+  td code, th code { font-family: var(--mono); font-size: .85em; color: var(--accent-ink); }
+  :root[data-theme="dark"] td code { color: var(--accent); }
+  .ft { font-family: var(--mono); font-size: .72rem; font-weight: 700; padding: .1rem .45rem; border-radius: 4px; white-space: nowrap; }
+  .ft.nf { color: var(--fix); background: var(--fix-soft); }
+  .ft.sf { color: var(--bug); background: var(--bug-soft); }
+
+  .callbar { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem 1.4rem; margin: 1.5rem 0; box-shadow: var(--shadow); }
+
+  footer { margin-top: 5rem; padding-top: 2rem; border-top: 1px solid var(--border); color: var(--ink-faint); font-size: .85rem; }
+
+  .navtoggle { display: none; }
+
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    .sidebar {
+      position: fixed; top: 0; left: 0; z-index: 50;
+      width: 280px; max-width: 85vw; height: 100vh;
+      background: var(--surface); transform: translateX(-100%);
+      transition: transform .22s ease; box-shadow: var(--shadow);
+    }
+    .sidebar.open { transform: translateX(0); }
+    .content { padding-top: 4.5rem; }
+    .navtoggle {
+      display: inline-flex; align-items: center; gap: .45rem;
+      position: fixed; top: .85rem; left: .85rem; z-index: 55;
+      font-family: var(--mono); font-size: .78rem; font-weight: 600;
+      padding: .5rem .8rem; border-radius: 7px; cursor: pointer;
+      background: var(--surface); color: var(--ink); border: 1px solid var(--border-strong);
+      box-shadow: var(--shadow);
+    }
+    .scrim { display: none; position: fixed; inset: 0; background: rgba(8,12,16,.45); z-index: 45; }
+    .scrim.show { display: block; }
+  }
+</style>
+
+<div class="page">
+<div class="progress" id="progress"></div>
+
+<button class="navtoggle" id="navtoggle" aria-label="Toggle contents">☰ Contents</button>
+<div class="scrim" id="scrim"></div>
+
+<div class="layout">
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><span class="dot"></span><b>bc-assessment-service</b></div>
+    <nav>
+      <ul class="toc" id="toc">
+        <li class="group">Orientation</li>
+        <li><a href="#intro">What this service is</a></li>
+        <li><a href="#flow">The request pipeline</a></li>
+        <li><a href="#rootcause">Root cause of the outage</a></li>
+
+        <li class="group">Contracts</li>
+        <li><a href="#schemas"><code>schemas.py</code></a></li>
+        <li><a href="#config"><code>config.py</code></a></li>
+
+        <li class="group">API layer</li>
+        <li><a href="#main"><code>main.py</code></a></li>
+
+        <li class="group">Core engine</li>
+        <li><a href="#lookup"><code>services/lookup.py</code></a></li>
+        <li><a href="#browser"><code>services/browser.py</code></a></li>
+        <li><a href="#scraper"><code>services/scraper.py</code></a></li>
+        <li><a href="#ratelimit"><code>services/rate_limit.py</code></a></li>
+
+        <li class="group">Persistence</li>
+        <li><a href="#connection"><code>db/connection.py</code></a></li>
+        <li><a href="#cache"><code>db/cache.py</code></a></li>
+        <li><a href="#failures"><code>db/failures.py</code></a></li>
+
+        <li class="group">Observability</li>
+        <li><a href="#stats"><code>services/stats.py</code></a></li>
+        <li><a href="#telegram"><code>services/telegram_notify.py</code></a></li>
+
+        <li class="group">Wrap-up</li>
+        <li><a href="#summary">How the fixes hold</a></li>
+      </ul>
+    </nav>
+  </aside>
+
+  <!-- ============ CONTENT ============ -->
+  <main class="content">
+
+    <!-- HERO / INTRO -->
+    <section id="intro" class="hero">
+      <p class="eyebrow">Engineering walkthrough</p>
+      <h1>How the BC&nbsp;Assessment service works</h1>
+      <p class="lead">A file-by-file, function-by-function tour of a FastAPI property-lookup service — and of the four defects that once made it hang and lie. Every design choice here exists to answer one of those defects, so the code and the incident are told together.</p>
+      <p>The service answers a single question: <em>given a formatted address, what does BC Assessment say this property is worth?</em> It checks a SQLite cache; on a miss it drives a real Chromium browser through <code class="ic">bcassessment.ca</code> with Playwright, parses the result with BeautifulSoup, and caches it. That is the easy version. The hard version — the reason this codebase exists — is making it do that <em>reliably, for hours, under concurrent load, without silently returning the wrong property.</em></p>
+      <div class="hero-meta">
+        <span class="chip">FastAPI + async</span>
+        <span class="chip">Playwright / Chromium</span>
+        <span class="chip">BeautifulSoup + lxml</span>
+        <span class="chip">SQLite (WAL)</span>
+        <span class="chip">Telegram alerts</span>
+      </div>
+
+      <h3>How to read this document</h3>
+      <p>Each colored callout carries a fixed meaning, so you can skim for the story beneath the code:</p>
+      <div class="legend">
+        <div class="item"><span class="sw" style="background:var(--bug)"></span><b>The defect</b><span>What used to break, and why it was invisible.</span></div>
+        <div class="item"><span class="sw" style="background:var(--fix)"></span><b>The fix</b><span>The code choice that removes it structurally.</span></div>
+        <div class="item"><span class="sw" style="background:var(--inv)"></span><b>Invariant</b><span>A rule that must hold or the outage returns.</span></div>
+      </div>
+    </section>
+
+    <!-- FLOW -->
+    <section id="flow">
+      <p class="eyebrow">Orientation</p>
+      <h2>The request pipeline</h2>
+      <p style="margin-top:1rem">One call to <code class="ic">GET /address</code> travels through eight stages across several modules. The ordering is not incidental — two of these stages sit in a specific place precisely <em>because</em> a naive ordering caused the original hang. This is a genuine sequence, so it is worth walking in order.</p>
+
+      <div class="pipe">
+        <div class="step"><h4>Validate &amp; normalize — <code>lookup_by_address()</code></h4><p>Trim the address; reject empty input early. Normalize to upper-case, single-spaced text so <code class="ic">"7009  tisdall st"</code> and <code class="ic">"7009 TISDALL ST"</code> share one cache key.</p></div>
+        <div class="step"><h4>Positive cache — <code>cache_get()</code></h4><p>A hit on a valid, unexpired row returns immediately. No browser, no network, no rate-limit cost. This is the whole point of the cache.</p></div>
+        <div class="step"><h4>Negative cache — <code>get_negative_cache()</code></h4><p>If this exact address was recently confirmed <em>not found</em>, return that without re-scraping. Unknown addresses otherwise burn the rate-limit budget on every request.</p></div>
+        <div class="step"><h4>Rate limit — <code>bc_rate_limiter.acquire()</code></h4><p>Wait for the minimum spacing and window/hourly caps <strong>before</strong> taking the scrape lock. Acquiring it inside the lock was the hang.</p></div>
+        <div class="step"><h4>Queue guard + single-flight lock + total timeout — <code>_run_scrape()</code></h4><p>Shed load past a queue depth (<code class="ic">busy</code>), then serialize scrapes through <code class="ic">Semaphore(1)</code> under a hard per-lookup ceiling so one stuck scrape can never wedge the service.</p></div>
+        <div class="step"><h4>Fresh context → scrape steps — <code>lookup_context()</code> + <code>scrape_address()</code></h4><p>A brand-new browser context and page per lookup. Load home, type the address, wait for autocomplete, open the property, confirm it rendered, extract HTML.</p></div>
+        <div class="step"><h4>Classify — <code>FailureType</code></h4><p>Every outcome is either a success or a <em>typed</em> failure: <code class="ic">not_found</code>, <code class="ic">blocked</code>, <code class="ic">timeout</code>, <code class="ic">parse_empty</code>, <code class="ic">error</code>, or <code class="ic">busy</code>.</p></div>
+        <div class="step"><h4>Record &amp; alert — <code>_record_outcome()</code></h4><p>Valid results go to the cache; failures go to a retry queue with reason/step/URL/snapshot; blocks fire a de-duplicated Telegram alert; recovery sends one all-clear.</p></div>
+      </div>
+    </section>
+
+    <!-- ROOT CAUSE -->
+    <section id="rootcause">
+      <p class="eyebrow">Orientation</p>
+      <h2>The root cause of the outage</h2>
+      <p style="margin-top:1rem">Before the code makes sense, the incident it answers must be clear. The old service worked after a restart and rotted within hours, so a systemd timer restarted it every two hours. <strong>A restart only clears two things — process memory and the cookie jar — which is exactly what tells you where the bug lived.</strong> Four defects compounded:</p>
+
+      <div class="note bug"><span class="nt">Defect 1 — the scraper never returned to a clean page</span>
+      <p>A guard checked <code class="ic">if page.locator("#rsbSearch").count() &gt; 0: return</code> to decide "already home." But BC's <em>result</em> pages carry that same search box in their header, so after the first lookup the guard short-circuited forever and every later search ran on the <em>previous property's page.</em></p></div>
+
+      <div class="note bug"><span class="nt">Defect 2 — that produced silently wrong data, not just hangs</span>
+      <p>Readiness was a text regex: <code class="ic">/Total value \$[\d,]+/</code>. Because of Defect 1 the DOM still showed the previous property's total value, so the wait returned <em>immediately from stale markup</em>, and the old numbers were cached under the new address. This is data corruption — plausible but wrong values.</p></div>
+
+      <div class="note bug"><span class="nt">Defect 3 — the browser and context were never recycled</span>
+      <p>The error path closed the page, but the context and browser lived for the whole process. Cookies, storage and Chromium memory accumulated until BC's bot mitigation served a challenge — after which every lookup timed out and every answer became "Property not found," permanently, until the next restart.</p></div>
+
+      <div class="note bug"><span class="nt">Defect 4 — the actual hang: rate-limit sleeps held the scrape lock</span>
+      <p>The scrape acquired <code class="ic">_scrape_lock</code>, then called <code class="ic">bc_rate_limiter.acquire()</code> <em>inside</em> it. At the hourly cap, one request slept up to an hour while holding the semaphore, freezing every queued request behind it.</p></div>
+
+      <div class="note"><span class="nt">And why every failure looked identical</span>
+      <p>A blanket <code class="ic">except Exception: return None</code> collapsed timeouts, challenge pages, network errors and genuinely unknown addresses into one <code class="ic">None</code>, which the API reported as "Property not found." Nobody could tell a blocked scraper from a nonexistent address. The redesign's spine — the <code class="ic">FailureType</code> enum — exists to end exactly that.</p></div>
+    </section>
+
+    <!-- ================= schemas.py ================= -->
+    <div class="filehead" id="schemas">
+      <div class="path"><span class="tag">Contract</span> app/schemas.py</div>
+      <p class="role">The data vocabulary of the whole service: the failure taxonomy, the result of one lookup attempt, and the exact JSON shapes the API returns. It is loaded first here because every other module speaks in these types.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">class FailureType(str, Enum)</div>
+      <p>Six named reasons a lookup produced no usable result. Subclassing <code class="ic">str</code> means the value serializes straight into JSON as <code class="ic">"not_found"</code>, <code class="ic">"blocked"</code>, etc.</p>
+      <pre class="code"><span class="k">class</span> FailureType(str, Enum):
+    NOT_FOUND   = <span class="s">"not_found"</span>    <span class="c"># autocomplete returned no real suggestion</span>
+    BLOCKED     = <span class="s">"blocked"</span>      <span class="c"># challenge / 403 / 429 / redirected off-site</span>
+    TIMEOUT     = <span class="s">"timeout"</span>      <span class="c"># a step exceeded its budget</span>
+    PARSE_EMPTY = <span class="s">"parse_empty"</span>  <span class="c"># page loaded but carried no total_value</span>
+    ERROR       = <span class="s">"error"</span>        <span class="c"># anything else</span>
+    BUSY        = <span class="s">"busy"</span>         <span class="c"># too many queued; caller should retry</span></pre>
+      <p class="label">Why it exists</p>
+      <p>This enum is the direct answer to "every failure looked identical." A blocked scraper and a fake address are now different values with different handling, different API messages, and different alerting.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">FailureType.is_scraper_fault -&gt; bool</div>
+      <p>A single predicate that encodes the most important distinction in the system: is this failure <em>ours</em> (or BC's), or is it the caller's address simply not existing?</p>
+      <pre class="code"><span class="k">@property</span>
+<span class="k">def</span> is_scraper_fault(self) -&gt; bool:
+    <span class="k">return</span> self <span class="k">is not</span> FailureType.NOT_FOUND</pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>Only <code class="ic">NOT_FOUND</code> is "not our fault." Health scoring, browser recycling and negative caching all branch on this one line — a run of unknown addresses must never be mistaken for a sick scraper.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">@dataclass LookupOutcome</div>
+      <p>The value every lookup path returns. It carries not just success/failure but <em>enough forensic context to alert and retry</em>: the reason, the page URL, the named step that broke, whether the browser was restarted, and any saved HTML snapshot.</p>
+      <pre class="code"><span class="k">@dataclass</span>
+<span class="k">class</span> LookupOutcome:
+    result: Optional[AssessmentResult] = None
+    failure: Optional[FailureType] = None
+    reason: Optional[str] = None
+    url: Optional[str] = None
+    step: Optional[str] = None
+    restarted: bool = False
+    snapshot_path: Optional[str] = None
+
+    <span class="k">@property</span>
+    <span class="k">def</span> ok(self) -&gt; bool:
+        <span class="k">return</span> self.result <span class="k">is not</span> None <span class="k">and</span> self.failure <span class="k">is</span> None</pre>
+      <p class="label">Why the two factory methods</p>
+      <p><code class="ic">LookupOutcome.success(result)</code> and <code class="ic">LookupOutcome.failed(type, reason, …)</code> keep construction uniform and impossible to get half-right — you cannot accidentally build an "outcome" that is both a success and a failure. <code class="ic">ok</code> is the one place that definition lives.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">AssessmentResult · AssessmentData · SuccessResponse · ErrorResponse</div>
+      <p>Pydantic models that pin the response bytes. The success envelope — <code class="ic">{"status":"success","data":{"result":{…},"status":200}}</code> — is a contract with the consuming BlueNest client and must not drift.</p>
+      <pre class="code"><span class="k">class</span> ErrorResponse(BaseModel):
+    status: str = <span class="s">"error"</span>
+    message: str = <span class="s">""</span>
+    <span class="c"># Additive: lets callers tell "no such property" from "scraper blocked".</span>
+    <span class="c"># Clients reading only status/message are unaffected.</span>
+    error_type: Optional[str] = None</pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>Success, and the exact string <code class="ic">"Property not found"</code>, stay byte-for-byte identical to the old service. <code class="ic">error_type</code> is <em>purely additive</em> — new information that never breaks an existing reader.</p></div>
+    </div>
+
+    <!-- ================= config.py ================= -->
+    <div class="filehead" id="config">
+      <div class="path"><span class="tag">Contract</span> app/config.py</div>
+      <p class="role">A single settings object built from <code class="ic">.env</code> at import time. Every tunable — timeouts, rate limits, browser recycling thresholds, Telegram credentials — lives here so behaviour is configured, not hard-coded.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">class Settings(BaseSettings) · settings = Settings()</div>
+      <p>Pydantic-settings reads each field from the environment / <code class="ic">.env</code>, with typed defaults. The module exposes one shared <code class="ic">settings</code> singleton.</p>
+      <pre class="code">scrape_cache_ttl_seconds: int = 0        <span class="c"># 0 = never expire (BC updates ~yearly)</span>
+scrape_total_timeout_ms: int = 60_000    <span class="c"># hard ceiling on one whole lookup</span>
+browser_max_lookups: int = 200           <span class="c"># recycle Chromium after N lookups</span>
+telegram_bot_token: str = <span class="s">""</span>            <span class="c"># set in .env ONLY; never commit a token</span>
+
+    model_config = SettingsConfigDict(env_file=<span class="s">".env"</span>, extra=<span class="s">"ignore"</span>)</pre>
+      <p class="label">Why a singleton read at call time</p>
+      <p>Modules read <code class="ic">settings.field</code> when they need it rather than capturing the value at import. That is what lets a test do <code class="ic">monkeypatch.setattr(settings, "field", value)</code> and have the live code pick it up — no dependency-injection plumbing required.</p>
+      <div class="note fix"><span class="nt">The fix — security</span><p>The Telegram token used to be a hard-coded default in this file. It is now an empty string; credentials come from <code class="ic">.env</code> only (which is gitignored), and a regression test asserts the defaults ship with no secret.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">Settings.get_telegram_chat_ids() -&gt; list[int]</div>
+      <p>Parses the comma-separated <code class="ic">TELEGRAM_CHAT_IDS</code> string into integers, skipping anything malformed instead of raising.</p>
+      <pre class="code"><span class="k">for</span> part <span class="k">in</span> self.telegram_chat_ids.split(<span class="s">","</span>):
+    <span class="k">try</span>:
+        ids.append(int(part.strip()))
+    <span class="k">except</span> ValueError:
+        <span class="c"># A malformed chat id must not take the whole service</span>
+        <span class="c"># down at import time. Skip it and carry on.</span>
+        <span class="k">continue</span></pre>
+      <p class="label">Problem it solves</p>
+      <p>Config is parsed once at process start. A single typo in an ops-managed <code class="ic">.env</code> should degrade alerting for one recipient, never prevent the service from booting.</p>
+    </div>
+
+    <!-- ================= main.py ================= -->
+    <div class="filehead" id="main">
+      <div class="path"><span class="tag">API</span> app/main.py</div>
+      <p class="role">The FastAPI surface: five routes plus a lifespan that owns startup and shutdown. The route handlers stay thin — they translate between HTTP and the lookup engine and nothing more.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">@asynccontextmanager async def lifespan(app)</div>
+      <p>Runs once at boot and once at shutdown. On boot it creates the DB schema and warms the browser so the first request is not slowed by a cold Chromium launch; on shutdown it tears the browser down, flushes any in-flight alerts, and closes the SQLite connection cleanly.</p>
+      <pre class="code"><span class="k">async def</span> lifespan(_app):
+    init_db()
+    <span class="k">await</span> warmup_browser()
+    <span class="k">try</span>:
+        <span class="k">yield</span>
+    <span class="k">finally</span>:
+        <span class="k">await</span> shutdown_browser()
+        <span class="k">await</span> flush_pending()      <span class="c"># let queued Telegram alerts finish</span>
+        close_connection()</pre>
+      <p class="label">Why lifespan and not on_event</p>
+      <p>A context manager guarantees the <code class="ic">finally</code> block runs on every shutdown path, so the browser process and DB handle are never leaked between restarts.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">@app.get("/address") async def get_address(address)</div>
+      <p>The only route the consumer cares about. It trims input, rejects empty strings with a clear error, delegates the real work to <code class="ic">lookup_by_address</code>, and maps the typed outcome onto the response contract.</p>
+      <pre class="code">outcome = <span class="k">await</span> lookup_by_address(address)
+
+<span class="k">if</span> outcome.ok <span class="k">and</span> outcome.result <span class="k">is not</span> None:
+    <span class="k">return</span> SuccessResponse(data=AssessmentData(result=outcome.result, status=200))
+
+failure = outcome.failure <span class="k">or</span> FailureType.ERROR
+<span class="k">return</span> ErrorResponse(
+    status=<span class="s">"error"</span>,
+    message=_FAILURE_MESSAGES.get(failure, <span class="s">"Lookup failed"</span>),
+    error_type=failure.value,          <span class="c"># the additive field</span>
+)</pre>
+      <p class="label">The mapping that preserves the contract</p>
+      <p><code class="ic">_FAILURE_MESSAGES</code> maps <code class="ic">NOT_FOUND → "Property not found"</code> (unchanged) while <code class="ic">blocked</code>/<code class="ic">timeout</code>/<code class="ic">busy</code> get their own human messages. Old clients read the same <code class="ic">status</code>/<code class="ic">message</code>; new clients can additionally branch on <code class="ic">error_type</code>.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">@app.get("/health") async def health()</div>
+      <p>Reports <em>real scraper health</em>, not mere process liveness — and returns HTTP 503 when the browser has failed repeatedly.</p>
+      <pre class="code"><span class="k">if not</span> browser_manager.is_healthy:
+    <span class="k">return</span> JSONResponse(status_code=503, content=body)
+<span class="k">return</span> body   <span class="c"># includes provider, cache size, unresolved failures, browser stats</span></pre>
+      <div class="note fix"><span class="nt">The fix — observability</span><p>The old service answered "200 OK" while its browser was wedged. Now a monitor, or systemd, can see a dead scraper behind a running process. This is what lets you retire the blind 2-hour restart.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">/stats · /failures · POST /failures/retry</div>
+      <p>The operations surface. <code class="ic">/stats</code> returns counters plus unresolved-failure counts and cache size; <code class="ic">/failures</code> lets you inspect the retry queue (with <code class="ic">?due_only</code> / <code class="ic">?include_resolved</code>); <code class="ic">POST /failures/retry</code> re-attempts failures whose backoff has elapsed.</p>
+      <pre class="code"><span class="k">@app.post</span>(<span class="s">"/failures/retry"</span>)
+<span class="k">async def</span> retry_failures(limit: int = Query(10, ge=1, le=100)):
+    <span class="k">return await</span> retry_failed_lookups(limit=limit)</pre>
+      <p class="label">Why these exist</p>
+      <p>They turn "the scraper is failing" from an opaque log grep into an inspectable, actionable queue — directly serving the PRD's requirement that failed addresses be stored for retry and later investigation.</p>
+    </div>
+
+    <!-- ================= lookup.py ================= -->
+    <div class="filehead" id="lookup">
+      <div class="path"><span class="tag">Engine</span> app/services/lookup.py</div>
+      <p class="role">The orchestrator — the heart of the redesign. It sequences cache → negative cache → rate limit → single-flight scrape → classify → record, and it is where Defect&nbsp;4 (the hang) is structurally fixed by ordering.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">_normalize_address(address) -&gt; str</div>
+      <p>Collapses whitespace and upper-cases, so every spelling of the same address maps to one cache key.</p>
+      <pre class="code"><span class="k">return</span> re.sub(<span class="s">r"\s+"</span>, <span class="s">" "</span>, address.strip().upper())</pre>
+      <p class="label">Why it matters</p>
+      <p>The cache and the negative cache are only useful if <code class="ic">"7009  Tisdall St"</code> and <code class="ic">"7009 TISDALL ST"</code> collide on purpose. Normalization is what makes a "repeated address" actually hit.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">_mock_lookup(address) -&gt; LookupOutcome</div>
+      <p>The provider used when <code class="ic">LOOKUP_PROVIDER=mock</code>. It runs the entire request path with no browser and no network, deriving deterministic figures from a hash of the address.</p>
+      <pre class="code">digest = int(hashlib.sha1(upper.encode()).hexdigest()[:6], 16)
+<span class="k">return</span> LookupOutcome.success(AssessmentResult(
+    total_value=<span class="s">f"${500_000 + digest % 1_500_000:,}"</span>, ...))</pre>
+      <p class="label">Two jobs</p>
+      <p>First, tests and local dev exercise the full API without Playwright. Second, because each address yields <em>distinct</em> figures, the load harness can assert that two different addresses never return the same <code class="ic">total_value</code> — the regression test for Defect&nbsp;2. Magic tokens (<code class="ic">NOWHERE</code>, <code class="ic">BLOCKED</code>) drive the failure branches.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">async def _run_scrape(address) -&gt; LookupOutcome</div>
+      <p>The concurrency-critical core. It applies a queue-depth guard, acquires the rate limiter <em>before</em> the lock, then runs one scrape at a time under a hard total timeout.</p>
+      <pre class="code"><span class="k">async with</span> _queue_lock:
+    <span class="k">if</span> max_depth &gt; 0 <span class="k">and</span> _queue_depth &gt;= max_depth:
+        <span class="k">return</span> LookupOutcome.failed(FailureType.BUSY, ...)   <span class="c"># shed load fast</span>
+    _queue_depth += 1
+
+<span class="c"># Outside the scrape lock on purpose — this is the Defect 4 fix.</span>
+<span class="k">await</span> bc_rate_limiter.acquire()
+
+<span class="k">async with</span> _scrape_lock:                       <span class="c"># Semaphore(1): one scrape at a time</span>
+    <span class="k">try</span>:
+        <span class="k">return await</span> asyncio.wait_for(
+            _scrape_once(address),
+            timeout=settings.scrape_total_timeout_ms / 1000)   <span class="c"># hard ceiling</span>
+    <span class="k">except</span> asyncio.TimeoutError:
+        browser_manager.request_restart(<span class="s">"lookup exceeded total timeout"</span>)
+        <span class="k">return</span> LookupOutcome.failed(FailureType.TIMEOUT, ..., step=<span class="s">"total_timeout"</span>)</pre>
+      <div class="note fix"><span class="nt">The fix — Defect 4 (the hang)</span><p>Rate limiting now happens <em>before</em> <code class="ic">_scrape_lock</code>, so a request sleeping at the hourly cap no longer holds the semaphore that every other request needs. Two more guards back it up: the queue-depth check returns a fast <code class="ic">busy</code> instead of letting callers pile up unboundedly, and <code class="ic">asyncio.wait_for</code> caps any single scrape — on breach it flags the browser for relaunch, because a lookup that blew its whole budget means Chromium is in a bad state.</p></div>
+      <p class="label">Note on the remaining edge</p>
+      <p>A capped-out <em>hourly</em> wait is still not bounded — waiters serialize on the limiter's own lock, and that wait sits outside the timeout. Callers past the queue depth get a fast <code class="ic">busy</code>; the honest fix would be to return <code class="ic">busy</code> once the projected wait exceeds a threshold. This is documented as a known limitation rather than hidden.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">async def lookup_by_address(address) -&gt; LookupOutcome</div>
+      <p>The public entry point that stitches the pipeline together in exactly the order shown at the top of this page.</p>
+      <pre class="code"><span class="c"># 1. Positive cache</span>
+cached = <span class="k">await</span> asyncio.to_thread(cache_get, normalized)
+<span class="k">if</span> cached <span class="k">is not</span> None <span class="k">and</span> is_valid_assessment(cached):
+    <span class="k">await</span> record_cache_hit(address);  <span class="k">return</span> LookupOutcome.success(cached)
+
+<span class="c"># 2. Negative cache — a recent, genuine "not found"</span>
+negative = <span class="k">await</span> asyncio.to_thread(failures.get_negative_cache, normalized)
+<span class="k">if</span> negative <span class="k">is not</span> None:
+    <span class="k">await</span> record_cache_hit(address);  <span class="k">return</span> LookupOutcome.failed(FailureType.NOT_FOUND, negative)
+
+<span class="c"># 3. Scrape (mock or live)</span>
+<span class="k">await</span> record_bc_scrape(address)
+outcome = _mock_lookup(address) <span class="k">if</span> mock <span class="k">else await</span> _run_scrape(address)
+<span class="k">await</span> _record_outcome(address, normalized, outcome)</pre>
+      <p class="label">Why the blocking DB calls go through <code class="ic">asyncio.to_thread</code></p>
+      <p>SQLite calls are synchronous. Wrapping them in <code class="ic">to_thread</code> keeps them off the event loop so a disk hiccup can't stall unrelated async requests. Note the scrape counter increments <em>before</em> dispatch, so it reflects exactly the traffic the cache is meant to eliminate.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">async def _record_outcome(address, normalized, outcome)</div>
+      <p>The single place results are persisted and alerted. Success and each failure class are handled distinctly.</p>
+      <pre class="code"><span class="k">if</span> outcome.ok <span class="k">and</span> outcome.result <span class="k">is not</span> None:
+    browser_manager.record_success()
+    <span class="k">await</span> asyncio.to_thread(cache_set, normalized, outcome.result)
+    <span class="k">await</span> asyncio.to_thread(failures.mark_resolved, normalized)  <span class="c"># clear old failure</span>
+    <span class="k">await</span> notify_recovered(address);  <span class="k">return</span>
+
+<span class="k">if</span> failure <span class="k">is</span> FailureType.BUSY:
+    <span class="k">return</span>   <span class="c"># load-shed, not a scraper fault — do not queue for retry</span>
+
+browser_manager.record_failure(failure)
+<span class="k">await</span> asyncio.to_thread(failures.record_failure, address, normalized, failure, ...)</pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>Only valid results reach <code class="ic">cache_set</code>; every failure goes to the <code class="ic">failed_lookups</code> queue instead. <code class="ic">BUSY</code> is deliberately <em>not</em> queued — it says nothing about browser health, only that the service was momentarily overloaded.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">warmup_browser() · shutdown_browser() · retry_failed_lookups(limit)</div>
+      <p>Lifecycle and maintenance helpers. Warmup pre-launches Chromium at boot (skipped in mock mode); shutdown tears it down; retry walks due failures and re-runs them through the normal path — skipping <code class="ic">not_found</code>, which is answered from the negative cache and needs no browser.</p>
+      <pre class="code"><span class="k">for</span> row <span class="k">in</span> due:
+    <span class="k">if</span> row[<span class="s">"failure_type"</span>] == FailureType.NOT_FOUND.value:
+        <span class="k">continue</span>                      <span class="c"># negative cache already covers these</span>
+    outcome = <span class="k">await</span> lookup_by_address(row[<span class="s">"address"</span>])
+    <span class="k">if</span> outcome.ok: recovered += 1</pre>
+    </div>
+
+    <!-- ================= browser.py ================= -->
+    <div class="filehead" id="browser">
+      <div class="path"><span class="tag">Engine</span> app/services/browser.py</div>
+      <p class="role">The Playwright lifecycle manager: one long-lived browser <em>process</em>, but a brand-new context and page for every single lookup. This file is where Defects 1, 2 and 3 are removed at the root rather than patched.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">async def _route_handler(route)</div>
+      <p>A request interceptor installed on every context. It aborts images, media and fonts, and known trackers (analytics, tag managers, Facebook, Hotjar…), letting everything else through.</p>
+      <pre class="code"><span class="k">if</span> request.resource_type <span class="k">in</span> _BLOCKED_RESOURCE_TYPES:   <span class="c"># image / media / font</span>
+    <span class="k">await</span> route.abort();  <span class="k">return</span>
+<span class="k">if</span> _BLOCKED_URL_RE.search(request.url):                  <span class="c"># trackers</span>
+    <span class="k">await</span> route.abort();  <span class="k">return</span>
+<span class="k">await</span> route.continue_()</pre>
+      <p class="label">Why block resources</p>
+      <p>The scraper needs the page's text, not its pictures. Dropping heavy and irrelevant requests speeds every lookup and shrinks Chromium's memory footprint — a performance win that costs nothing in correctness. The whole handler is wrapped so a route failing mid-teardown can never surface as a lookup error.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">@dataclass BrowserHealth</div>
+      <p>The mutable health record behind <code class="ic">/health</code>: consecutive failures, lookups since launch, totals, timestamps, last failure type, and restart count. <code class="ic">as_dict()</code> renders it for the health endpoint.</p>
+      <pre class="code">consecutive_failures: int = 0
+lookups_since_browser_launch: int = 0
+last_failure_type: Optional[str] = None
+restarts: int = 0</pre>
+      <p class="label">Purpose</p>
+      <p>These counters are the evidence base for two automatic decisions: when to recycle the browser, and when to declare the service unhealthy.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">record_success() · record_failure(failure)</div>
+      <p>Update the health record after each lookup. Success resets the consecutive-failure streak; failure advances it — but with a crucial exception.</p>
+      <pre class="code"><span class="k">def</span> record_failure(self, failure):
+    self._health.total_lookups += 1
+    self._health.lookups_since_browser_launch += 1
+    <span class="c"># A genuine NOT_FOUND means the address doesn't exist, not that</span>
+    <span class="c"># the scraper is sick. Don't let it drive /health to 503.</span>
+    <span class="k">if not</span> failure.is_scraper_fault:
+        <span class="k">return</span>
+    self._health.consecutive_failures += 1
+    <span class="k">if</span> self._health.consecutive_failures &gt;= settings.browser_restart_after_failures:
+        self.request_restart(<span class="s">f"{...} consecutive failures"</span>)</pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>A run of unknown addresses is normal traffic. If <code class="ic">not_found</code> counted toward "unhealthy," ordinary lookups would push <code class="ic">/health</code> to 503, a monitor would restart the service, and the restart loop this work removed would quietly return. The <code class="ic">is_scraper_fault</code> guard is what prevents that.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">_needs_restart() -&gt; (bool, reason) · ensure_browser() -&gt; bool</div>
+      <p><code class="ic">ensure_browser</code> lazily launches Chromium, and relaunches it whenever <code class="ic">_needs_restart</code> says so: no browser, a disconnected browser, a pending restart request, or the per-browser lookup budget reached.</p>
+      <pre class="code"><span class="k">def</span> _needs_restart(self):
+    <span class="k">if</span> self._browser <span class="k">is</span> None:                 <span class="k">return</span> True, <span class="s">"no browser"</span>
+    <span class="k">if not</span> self._browser.is_connected():      <span class="k">return</span> True, <span class="s">"browser disconnected"</span>
+    <span class="k">if</span> self._restart_pending:                 <span class="k">return</span> True, self._restart_reason
+    <span class="k">if</span> lookups_since_launch &gt;= max_lookups:   <span class="k">return</span> True, <span class="s">"reached N lookups"</span>
+    <span class="k">return</span> False, <span class="s">""</span></pre>
+      <div class="note fix"><span class="nt">The fix — Defect 3</span><p>The browser is now <em>recycled</em>: after <code class="ic">BROWSER_MAX_LOOKUPS</code>, after too many consecutive failures, or on disconnect. Recycling drops the accumulated cookies and Chromium memory that used to build up until BC served a challenge page. An <code class="ic">asyncio.Lock</code> around launch means concurrent callers can't spawn two browsers.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">@asynccontextmanager async def lookup_context() -&gt; (Page, restarted)</div>
+      <p>The single sanctioned way to obtain a page. It creates a fresh context, installs the route filter, yields a clean page, and <strong>always</strong> closes the context in <code class="ic">finally</code>.</p>
+      <pre class="code">context = <span class="k">await</span> browser.new_context(user_agent=USER_AGENT,
+                                     viewport={...}, locale=<span class="s">"en-CA"</span>)
+<span class="k">await</span> context.route(<span class="s">"**/*"</span>, _route_handler)
+page = <span class="k">await</span> context.new_page()
+<span class="k">try</span>:
+    <span class="k">yield</span> page, restarted
+<span class="k">finally</span>:
+    <span class="k">await</span> context.close()      <span class="c"># no DOM or cookie state survives to the next lookup</span></pre>
+      <div class="note fix"><span class="nt">The fix — Defects 1 &amp; 2</span><p>A fresh context per lookup makes stale markup <em>impossible</em>, not merely unlikely. There is no previous property's page to short-circuit on, and no previous "Total value" left in the DOM for the readiness check to match. The two data-corruption defects are removed structurally: the state that carried the bug no longer exists between lookups. The browser process is reused (cheap); only the ~200–400 ms context is rebuilt (correct).</p></div>
+    </div>
+
+    <!-- ================= scraper.py ================= -->
+    <div class="filehead" id="scraper">
+      <div class="path"><span class="tag">Engine</span> app/services/scraper.py</div>
+      <p class="role">The named scraping steps, block detection, and HTML parsing. Every step is labeled so a failure reports <em>where</em> it broke, and every exit is a classified <code class="ic">FailureType</code> — never a bare <code class="ic">None</code>.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">parse_html(html) · _find_value_after_label() · _find_total_value()</div>
+      <p>Turn the property page into an <code class="ic">AssessmentResult</code>. <code class="ic">_find_total_value</code> regex-scans the whole page text for "Total value $…"; <code class="ic">_find_value_after_label</code> locates a label node and reads the sibling/row value beside it, which survives BC's inconsistent markup better than fixed CSS paths.</p>
+      <pre class="code"><span class="k">try</span>:
+    soup = BeautifulSoup(html, <span class="s">"lxml"</span>)        <span class="c"># fast, forgiving on malformed markup</span>
+<span class="k">except</span> Exception:
+    soup = BeautifulSoup(html, <span class="s">"html.parser"</span>)  <span class="c"># stdlib fallback</span></pre>
+      <p class="label">Why label-relative parsing</p>
+      <p>BC Assessment's layout is not stable, so "find the text next to the word <em>Bedrooms</em>" is more robust than a brittle selector chain. <code class="ic">lxml</code> is preferred for speed and tolerance, with the stdlib parser as a safety net.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">detect_block(html, url, status) -&gt; Optional[str]</div>
+      <p>The block detector, run at multiple points in the scrape. It layers three cheap checks and returns a human-readable reason string (or <code class="ic">None</code>).</p>
+      <pre class="code"><span class="k">if</span> status <span class="k">is not</span> None <span class="k">and</span> status &gt;= 400:
+    <span class="k">return</span> <span class="s">f"HTTP {status} from BC Assessment"</span>          <span class="c"># 403 / 429 / 5xx</span>
+<span class="k">if</span> url <span class="k">and</span> <span class="s">"bcassessment.ca"</span> <span class="k">not in</span> url:
+    <span class="k">return</span> <span class="s">f"redirected off-site to {url}"</span>            <span class="c"># WAF bounce</span>
+<span class="k">for</span> marker <span class="k">in</span> _BLOCK_MARKERS:                         <span class="c"># "captcha", "unusual traffic"…</span>
+    <span class="k">if</span> marker <span class="k">in</span> lowered:
+        <span class="k">return</span> <span class="s">f"block marker: {marker!r}"</span></pre>
+      <div class="note fix"><span class="nt">The fix — separating "blocked" from everything else</span><p>Checking HTTP status, off-site redirects and content markers <em>before</em> falling back to a timeout classification is what lets the service say "we are being blocked" instead of misreporting a challenge page as "Property not found." It runs on the home page, on a missing search box, on a stalled result, and on the final HTML.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">save_snapshot(address, html) · _prune_snapshots(root)</div>
+      <p>When a page looks blocked or unexpected, its HTML is written to <code class="ic">data/snapshots/</code> with a timestamped, hashed filename; old snapshots beyond <code class="ic">SNAPSHOT_KEEP</code> are pruned.</p>
+      <pre class="code">path = root / <span class="s">f"{stamp}_{digest}.html"</span>
+path.write_text(html, encoding=<span class="s">"utf-8"</span>, errors=<span class="s">"replace"</span>)
+_prune_snapshots(root)   <span class="c"># keep only the newest SNAPSHOT_KEEP files</span></pre>
+      <p class="label">Purpose</p>
+      <p>A block can't always be reproduced on demand, so the evidence is captured the moment it happens. The snapshot path travels on the <code class="ic">LookupOutcome</code> into both the retry queue and the Telegram alert.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">async def scrape_address(page, address, *, restarted)</div>
+      <p>The lookup itself, as five named steps on a guaranteed-clean page. Each step sets a <code class="ic">step</code> label, and any failure returns a classified outcome carrying that label.</p>
+      <pre class="code">step = <span class="s">"goto_home"</span>        <span class="c"># 1. load home; detect_block on the response</span>
+step = <span class="s">"await_search_box"</span>  <span class="c">#    wait for #rsbSearch (block vs timeout on miss)</span>
+step = <span class="s">"fill_search"</span>      <span class="c"># 2. click + fill the address (fill, as BC's autocomplete needs)</span>
+step = <span class="s">"await_autocomplete"</span><span class="c"># 3. wait for suggestions; else _classify_missing_autocomplete</span>
+step = <span class="s">"click_suggestion"</span> <span class="c"># 4. open the first real suggestion</span>
+step = <span class="s">"await_result_nav"</span> <span class="c">#    wait for URL change AND the readiness predicate</span>
+step = <span class="s">"extract_html"</span>     <span class="c"># 5. re-check block, then parse</span>
+step = <span class="s">"parse"</span>            <span class="c">#    PARSE_EMPTY if no total_value survived</span></pre>
+      <p class="label">Why every step is named</p>
+      <p>"It failed" is not actionable; "it failed at <code class="ic">await_autocomplete</code> on this URL for this address" is. The label flows into logs, the retry queue and alerts, so a bad lookup can be traced without reproducing it. A trailing <code class="ic">try/except</code> converts any Playwright timeout into <code class="ic">TIMEOUT</code> and anything else into <code class="ic">ERROR</code>, both tagged with the step that was live.</p>
+      <div class="note inv"><span class="nt">Invariant</span><p>Because <code class="ic">lookup_context()</code> hands over a fresh page, the readiness check <code class="ic">/Total value \$[\d,]+/</code> is trustworthy again — there is no prior property's value in the DOM to satisfy it early. The same regex that was dangerous in the old code is safe here purely because the state it reads is clean.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">async def _classify_missing_autocomplete(page, address, *, step, restarted)</div>
+      <p>The judgement call the old code could not make: when no suggestion appears, is the address unknown, or is the scraper in trouble?</p>
+      <pre class="code">reason = detect_block(html, url, None)
+<span class="k">if</span> reason:
+    <span class="k">return</span> LookupOutcome.failed(FailureType.BLOCKED, reason, ...)
+
+search_alive = <span class="k">await</span> page.locator(SEARCH_SELECTOR).count() &gt; 0
+typed        = <span class="k">await</span> page.locator(SEARCH_SELECTOR).first.input_value(...)
+
+<span class="k">if</span> search_alive <span class="k">and</span> typed.strip():
+    <span class="c"># Page healthy, our text still in the box, no block → genuinely unknown</span>
+    <span class="k">return</span> LookupOutcome.failed(FailureType.NOT_FOUND, <span class="s">"no suggestion for this address"</span>, ...)
+
+<span class="k">return</span> LookupOutcome.failed(FailureType.TIMEOUT, <span class="s">"autocomplete never appeared…"</span>, ...)</pre>
+      <div class="note fix"><span class="nt">The fix — not_found vs timeout vs blocked</span><p>This is the exact ambiguity that turned every failure into "Property not found." The heuristic checks block markers first, then whether the page is otherwise healthy (search box present, our text still in it). Only a healthy page with no suggestion is a true <code class="ic">NOT_FOUND</code>; anything else is a scraper fault that must be retried, not cached.</p></div>
+    </div>
+
+    <!-- ================= rate_limit.py ================= -->
+    <div class="filehead" id="ratelimit">
+      <div class="path"><span class="tag">Engine</span> app/services/rate_limit.py</div>
+      <p class="role">Three composable limiters that together keep the service a polite guest on bcassessment.ca: a minimum spacing between requests, a short-window cap, and an hourly cap. Cache hits are never rate-limited — only real BC visits.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">class BCRateLimiter — sliding-window cap</div>
+      <p>Allows at most <code class="ic">max_calls</code> BC operations per <code class="ic">window_seconds</code>, using a deque of timestamps. When full, it sleeps exactly until the oldest timestamp ages out.</p>
+      <pre class="code"><span class="k">while</span> self._timestamps <span class="k">and</span> now - self._timestamps[0] &gt;= self.window_seconds:
+    self._timestamps.popleft()               <span class="c"># drop timestamps outside the window</span>
+<span class="k">if</span> len(self._timestamps) &lt; self.max_calls:
+    self._timestamps.append(now);  <span class="k">return</span>   <span class="c"># room — record and proceed</span>
+wait = self.window_seconds - (now - self._timestamps[0])
+<span class="k">await</span> asyncio.sleep(max(wait, 0.05))          <span class="c"># else sleep until a slot frees</span></pre>
+      <p class="label">Why a sliding window</p>
+      <p>A fixed bucket allows bursts at boundaries; a sliding window smooths traffic to a true rate, which is what avoids tripping BC's throttling.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">class BCMinIntervalLimiter · class BCRateLimitGroup</div>
+      <p><code class="ic">BCMinIntervalLimiter</code> enforces a floor of <code class="ic">min_interval_seconds</code> between consecutive requests. <code class="ic">BCRateLimitGroup</code> chains all enabled limiters so every tier must clear before a scrape proceeds.</p>
+      <pre class="code">bc_rate_limiter = BCRateLimitGroup(
+    BCMinIntervalLimiter(min_interval_seconds),   <span class="c"># ≥ 4s between visits</span>
+    BCRateLimiter(short_max, 60),                 <span class="c"># burst cap</span>
+    BCRateLimiter(hourly_max, 3600),              <span class="c"># hourly ceiling</span>
+)</pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>This whole group is acquired <em>before</em> the scrape lock (see <code class="ic">_run_scrape</code>). That ordering is Defect 4's fix — a limiter sleeping at the hourly cap must never be holding the semaphore the rest of the service is waiting on.</p></div>
+    </div>
+
+    <!-- ================= connection.py ================= -->
+    <div class="filehead" id="connection">
+      <div class="path"><span class="tag">Data</span> app/db/connection.py</div>
+      <p class="role">Owns the one shared SQLite connection <em>and</em> the schema DDL, so the runtime and the setup script can never drift. The schema is <code class="ic">CREATE TABLE IF NOT EXISTS</code> throughout and is re-applied on connect.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">SCHEMA · init_db(path) · db_path()</div>
+      <p>Defines two tables — <code class="ic">assessment_cache</code> (successes) and <code class="ic">failed_lookups</code> (failures + negative cache) — and applies them idempotently. <code class="ic">setup_db.py</code> reuses this exact DDL.</p>
+      <pre class="code"><span class="k">def</span> init_db(path=None):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    conn.executescript(SCHEMA)     <span class="c"># CREATE TABLE IF NOT EXISTS … idempotent</span></pre>
+      <p class="label">Why the schema lives here</p>
+      <p>Because the runtime and the migration script apply the <em>same</em> string, a database created before <code class="ic">failed_lookups</code> existed gains the table simply by connecting. There is no separate migration to forget.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">get_connection() — single shared connection, WAL mode</div>
+      <p>Returns one process-wide connection (created lazily under a lock), tuned for a mixed read/write workload.</p>
+      <pre class="code">conn = sqlite3.connect(path, check_same_thread=False, timeout=15.0)
+conn.execute(<span class="s">"PRAGMA journal_mode=WAL"</span>)      <span class="c"># a write never blocks a read</span>
+conn.execute(<span class="s">"PRAGMA synchronous=NORMAL"</span>)
+conn.execute(<span class="s">"PRAGMA busy_timeout=15000"</span>)</pre>
+      <p class="label">Why one connection + WAL</p>
+      <p>The old code opened and closed a connection on every cache read/write. One shared connection removes that churn; WAL lets the cache be read while a failure is being written, which matters because both happen on the same request path. <code class="ic">reset_for_tests()</code> drops the cached handle so a test can point at a throwaway DB.</p>
+    </div>
+
+    <!-- ================= cache.py ================= -->
+    <div class="filehead" id="cache">
+      <div class="path"><span class="tag">Data</span> app/db/cache.py</div>
+      <p class="role">The positive cache — successful lookups only. Its defining rule is what it <em>refuses</em> to store.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">cache_set(address_key, result) — refuses invalid results</div>
+      <p>Upserts a result, but first guards that it actually carries a <code class="ic">total_value</code>. Without one, it logs and returns instead of writing.</p>
+      <pre class="code"><span class="k">if not</span> result.total_value:
+    <span class="c"># An entry without a total value is exactly the "invalid result</span>
+    <span class="c"># cached as success" failure mode this service used to have.</span>
+    logger.warning(<span class="s">"Refusing to cache result without total_value …"</span>)
+    <span class="k">return</span>
+... INSERT ... ON CONFLICT(address) DO UPDATE SET ...   <span class="c"># idempotent upsert</span></pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>Only valid results reach <code class="ic">assessment_cache</code>. This guard is defensive depth: the lookup layer already routes failures elsewhere, but <code class="ic">cache_set</code> enforces the rule at the last possible moment so no future caller can smuggle a bad result into the cache.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">cache_get() · _is_expired() · cache_delete() · cache_count()</div>
+      <p>Reads a row, transparently drops it if the TTL has elapsed, and reports the cache size for <code class="ic">/health</code> and <code class="ic">/stats</code>. Every DB call is wrapped so a SQLite error degrades to a cache miss rather than a 500.</p>
+      <pre class="code"><span class="k">def</span> _is_expired(created_at):
+    ttl = settings.scrape_cache_ttl_seconds
+    <span class="k">if</span> ttl &lt;= 0:  <span class="k">return</span> False        <span class="c"># 0 = never expire (recommended)</span>
+    <span class="k">return</span> (now - created).total_seconds() &gt; ttl</pre>
+      <div class="note fix"><span class="nt">The fix — a contributing factor</span><p>The server previously ran <code class="ic">SCRAPE_CACHE_TTL_SECONDS=3600</code>, so every cached address was re-scraped hourly even though BC data changes about once a year. That multiplied traffic and the odds of being throttled. The default is now <code class="ic">0</code> — never expire.</p></div>
+    </div>
+
+    <!-- ================= failures.py ================= -->
+    <div class="filehead" id="failures">
+      <div class="path"><span class="tag">Data</span> app/db/failures.py</div>
+      <p class="role">The retry queue — and, for genuine <code class="ic">not_found</code> addresses, a negative cache. It keeps a durable, inspectable record of every lookup that didn't yield a result, with enough context to investigate and retry.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">record_failure(...) · _next_retry_at(attempts)</div>
+      <p>Upserts a failure keyed by normalized address, incrementing the attempt count and scheduling the next retry with capped exponential backoff.</p>
+      <pre class="code">attempts = (row[<span class="s">"attempts"</span>] + 1) <span class="k">if</span> row <span class="k">else</span> 1
+... ON CONFLICT(normalized_address) DO UPDATE SET
+    failure_type=..., reason=..., step=..., url=...,
+    html_snapshot_path = COALESCE(excluded..., failed_lookups...),  <span class="c"># keep first snapshot</span>
+    attempts=?, next_retry_at=..., resolved_at=NULL
+
+<span class="k">def</span> _next_retry_at(attempts):
+    minutes = min(15 * 2**(attempts-1), 24*60)   <span class="c"># 15m, 30m, 60m … capped at 24h</span></pre>
+      <p class="label">Why backoff</p>
+      <p>A transiently blocked or slow site should be retried gently, not hammered. Exponential backoff spaces retries out; the 24-hour cap keeps a permanently-broken address from drifting to never.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">get_negative_cache(normalized) -&gt; Optional[str]</div>
+      <p>Returns a reason if this address is a still-fresh, genuine <code class="ic">not_found</code> — and <em>only</em> for that type.</p>
+      <pre class="code">SELECT reason, last_failed_at FROM failed_lookups
+WHERE normalized_address = ?
+  <span class="k">AND</span> failure_type = <span class="s">'not_found'</span>    <span class="c"># scraper faults are NEVER negatively cached</span>
+  <span class="k">AND</span> resolved_at <span class="k">IS</span> NULL
+<span class="c"># …then honour NOT_FOUND_CACHE_TTL_SECONDS before trusting it</span></pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>Only <code class="ic">NOT_FOUND</code> may be negatively cached. Caching a <code class="ic">blocked</code>/<code class="ic">timeout</code>/<code class="ic">error</code> would freeze a transient outage into a permanent wrong answer — the very failure mode this project was hired to kill. Serving a known miss from here saves the rate-limit budget an unknown address would otherwise spend on every request.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">mark_resolved() · list_failures() · failure_counts()</div>
+      <p>Housekeeping and inspection. A later success calls <code class="ic">mark_resolved</code> to clear an address from the queue; <code class="ic">list_failures</code> powers <code class="ic">/failures</code> (with due-only / include-resolved filters); <code class="ic">failure_counts</code> feeds the unresolved-by-type breakdown on <code class="ic">/health</code> and <code class="ic">/stats</code>.</p>
+      <pre class="code">SELECT failure_type, COUNT(*) FROM failed_lookups
+WHERE resolved_at <span class="k">IS</span> NULL GROUP BY failure_type</pre>
+    </div>
+
+    <!-- ================= stats.py ================= -->
+    <div class="filehead" id="stats">
+      <div class="path"><span class="tag">Observability</span> app/services/stats.py</div>
+      <p class="role">Request counters, milestone reporting, and — most importantly — the failure-alerting logic, de-duplicated so a block storm produces one message, with a matching all-clear on recovery.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">is_valid_assessment() · record_cache_hit() · record_bc_scrape() · get_stats()</div>
+      <p><code class="ic">is_valid_assessment</code> is the shared "does this result carry a total value" check. The two counters track cache hits vs real BC scrapes under an async lock, and fire a Telegram milestone every <code class="ic">STATS_MILESTONE_COUNT</code> calls before resetting.</p>
+      <pre class="code"><span class="k">async with</span> _lock:
+    _bc_calls += 1
+    <span class="k">if</span> _bc_calls &gt;= settings.stats_milestone_count:
+        _cache_calls = _bc_calls = 0          <span class="c"># reset and report the ratio</span>
+        milestone_msg = <span class="s">f"BC scrapes reached {…}. Counts reset."</span></pre>
+      <p class="label">Why the ratio matters</p>
+      <p>The cache-hit vs scrape ratio is the single best signal of whether the cache is doing its job. A milestone that shows mostly scrapes means addresses aren't repeating — or the TTL is too low.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">async def notify_failure(address, outcome)</div>
+      <p>The block alert the PRD cares most about. It is de-duplicated per failure type, and carries every field the spec requires.</p>
+      <pre class="code"><span class="k">async with</span> _alerting_lock:
+    <span class="k">if</span> last <span class="k">is not</span> None <span class="k">and</span> (now - last) &lt; interval:
+        <span class="k">return</span>                 <span class="c"># suppress duplicate within ALERT_MIN_INTERVAL_SECONDS</span>
+    _last_alert_at[key] = now
+    _in_failure_state = True
+
+lines = [<span class="s">f"BC Assessment: {failure.value.upper()}"</span>,
+         <span class="s">f"Address: {address}"</span>, <span class="s">f"Failure type: {…}"</span>, <span class="s">f"Failed step: {outcome.step}"</span>,
+         <span class="s">f"URL: {outcome.url}"</span>, <span class="s">f"Reason: {outcome.reason}"</span>, <span class="s">f"Timestamp: {…}"</span>,
+         <span class="s">f"Browser restarted: {…}"</span>]   <span class="c"># + snapshot path + suggested action</span></pre>
+      <div class="note fix"><span class="nt">The fix — immediate, actionable alerts</span><p>Address, failure type, URL, reason, timestamp, restart status, snapshot path, and a per-type <em>suggested next action</em> — exactly the fields the PRD asks for. De-duplication means a storm of blocks sends one message per type per interval, not one per request, so the alert stays useful instead of becoming noise.</p></div>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">notify_recovered() · notify_not_found() · notify_no_address()</div>
+      <p><code class="ic">notify_recovered</code> sends a single all-clear the first time scraping works again after a failure state, then clears the de-dup timers so the next incident alerts freshly. The other two are lightweight notices for a true miss and for empty input.</p>
+      <pre class="code"><span class="k">async with</span> _alerting_lock:
+    <span class="k">if not</span> _in_failure_state:  <span class="k">return</span>     <span class="c"># only alert recovery if we were failing</span>
+    _in_failure_state = False
+    _last_alert_at.clear()</pre>
+      <p class="label">Why an all-clear</p>
+      <p>Knowing an incident <em>ended</em> is as valuable as knowing it started — it closes the loop without anyone having to poll <code class="ic">/health</code>.</p>
+    </div>
+
+    <!-- ================= telegram_notify.py ================= -->
+    <div class="filehead" id="telegram">
+      <div class="path"><span class="tag">Observability</span> app/services/telegram_notify.py</div>
+      <p class="role">The Telegram transport: fire-and-forget delivery that can never raise into, or block, a lookup.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">send_telegram_message_background(text) — strong task refs</div>
+      <p>Schedules the async send without awaiting it, and keeps a strong reference to the task until it finishes.</p>
+      <pre class="code">task = loop.create_task(send_telegram_message(text))
+_background_tasks.add(task)                       <span class="c"># asyncio holds only a WEAK ref —</span>
+task.add_done_callback(_background_tasks.discard) <span class="c"># without this the alert can be GC'd mid-flight</span></pre>
+      <p class="label">The subtle bug this avoids</p>
+      <p>asyncio keeps only a weak reference to a running task, so a bare <code class="ic">create_task</code> can be garbage-collected before it sends and the alert is silently lost. Holding a strong reference until the done-callback fires is the documented fix.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">_enabled() · send_telegram_message() · flush_pending()</div>
+      <p><code class="ic">_enabled</code> gates everything on a token <em>and</em> at least one chat id being configured, so a stock deployment stays silent rather than erroring. <code class="ic">send_telegram_message</code> posts to each chat and swallows per-recipient failures. <code class="ic">flush_pending</code> waits briefly for in-flight sends on shutdown.</p>
+      <pre class="code"><span class="k">def</span> _enabled():
+    <span class="k">return</span> bool(settings.telegram_bot_token <span class="k">and</span> settings.get_telegram_chat_ids())</pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>Alerting is best-effort and isolated: no Telegram failure — bad token, network blip, no event loop — is ever allowed to surface as a lookup error. Monitoring must not become a source of outages.</p></div>
+    </div>
+
+    <!-- ================= SUMMARY ================= -->
+    <section id="summary">
+      <div class="filehead" style="border-top-color:var(--accent)">
+        <div class="path"><span class="tag">Wrap-up</span> How the fixes hold together</div>
+        <p class="role">Each original defect is now answered by a specific, structural change — not a patch that makes the failure rarer, but a design that makes it impossible or self-correcting.</p>
+      </div>
+
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Original defect</th><th>Class</th><th>Structural answer</th><th>Where</th></tr></thead>
+          <tbody>
+            <tr><td>Stale page reused across lookups</td><td><span class="ft sf">corruption</span></td><td>Fresh <code>BrowserContext</code> + page per lookup, always torn down</td><td><code>browser.py</code></td></tr>
+            <tr><td>Readiness matched previous property's value</td><td><span class="ft sf">corruption</span></td><td>Clean context means no stale "Total value" to match early</td><td><code>browser.py</code> + <code>scraper.py</code></td></tr>
+            <tr><td>Browser/context never recycled → challenge page</td><td><span class="ft sf">degradation</span></td><td>Recycle after N lookups / N failures / disconnect</td><td><code>browser.py</code></td></tr>
+            <tr><td>Rate-limit sleep held the scrape lock</td><td><span class="ft sf">hang</span></td><td>Acquire rate limiter <em>before</em> the lock; queue guard; total-timeout ceiling</td><td><code>lookup.py</code></td></tr>
+            <tr><td>Every failure collapsed to <code>None</code></td><td><span class="ft sf">blindness</span></td><td><code>FailureType</code> taxonomy, named steps, block detection</td><td><code>schemas.py</code> + <code>scraper.py</code></td></tr>
+            <tr><td>Invalid results cached as success</td><td><span class="ft sf">corruption</span></td><td><code>cache_set</code> refuses rows without <code>total_value</code></td><td><code>cache.py</code></td></tr>
+            <tr><td>Unknown addresses re-scraped every time</td><td><span class="ft nf">waste</span></td><td>Negative cache for <code>not_found</code> only</td><td><code>failures.py</code></td></tr>
+            <tr><td>Blocks were invisible</td><td><span class="ft sf">silence</span></td><td>De-duplicated Telegram alerts + all-clear + <code>/health</code> 503</td><td><code>stats.py</code> + <code>main.py</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callbar">
+        <p style="margin-top:0"><strong>The through-line.</strong> The old service degraded and a timer restarted it, because a restart cleared the two things that were wrong: process memory and cookies. This design removes the need for that restart by never letting those two things accumulate in the first place — a clean context per lookup, a recycled browser, ordering that can't deadlock, and a failure taxonomy that tells the truth. <code class="ic">Restart=always</code> remains only as a genuine crash recovery, not as the fix.</p>
+      </div>
+    </section>
+
+    <footer>
+      <p>Generated walkthrough of <code class="ic">bc-assessment-service</code> · request flow <code class="ic">main.py → lookup.py → browser.py / scraper.py → db/</code> · every design choice traced to the production incident it prevents.</p>
+    </footer>
+
+  </main>
+</div>
+
+<script>
+  (function () {
+    // reading progress
+    var progress = document.getElementById('progress');
+    function onScroll() {
+      var h = document.documentElement;
+      var max = h.scrollHeight - h.clientHeight;
+      var pct = max > 0 ? (h.scrollTop / max) * 100 : 0;
+      progress.style.width = pct + '%';
+    }
+    document.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+
+    // scrollspy
+    var links = Array.prototype.slice.call(document.querySelectorAll('#toc a'));
+    var map = {};
+    links.forEach(function (a) {
+      var id = a.getAttribute('href').slice(1);
+      var el = document.getElementById(id);
+      if (el) map[id] = a;
+    });
+    var targets = Object.keys(map).map(function (id) { return document.getElementById(id); });
+    var current = null;
+    var obs = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          if (current) current.classList.remove('active');
+          current = map[e.target.id];
+          if (current) current.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-10% 0px -80% 0px', threshold: 0 });
+    targets.forEach(function (t) { obs.observe(t); });
+
+    // mobile nav
+    var sidebar = document.getElementById('sidebar');
+    var toggle = document.getElementById('navtoggle');
+    var scrim = document.getElementById('scrim');
+    function close() { sidebar.classList.remove('open'); scrim.classList.remove('show'); }
+    toggle.addEventListener('click', function () {
+      var open = sidebar.classList.toggle('open');
+      scrim.classList.toggle('show', open);
+    });
+    scrim.addEventListener('click', close);
+    document.querySelectorAll('#toc a').forEach(function (a) {
+      a.addEventListener('click', close);
+    });
+  })();
+</script>
+</div>
+</body>
+</html>
