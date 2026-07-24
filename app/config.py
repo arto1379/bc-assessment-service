@@ -44,8 +44,8 @@ class Settings(BaseSettings):
     snapshot_keep: int = 50
 
     # Telegram alerts — set these in .env only. Never commit a real token.
-    telegram_bot_token: str = ""
-    telegram_chat_ids: str = ""  # comma-separated
+    telegram_bot_token: str = "8875693188:AAGCFUTdBRuh_ggYMyNPvi4cx1rur5E8aKk"
+    telegram_chat_ids: str = "76370776"  # comma-separated
     stats_milestone_count: int = 100
     # Minimum seconds between repeat alerts of the same failure type
     alert_min_interval_seconds: float = 300.0
