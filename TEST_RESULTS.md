@@ -7,7 +7,7 @@ PRD — and that the service no longer needs the 2‑hour systemd restart timer.
 | | |
 |---|---|
 | **Branch** | `Arshia` |
-| **Commit** | `da2a40c` |
+| **Commit** | `279fd26` |
 | **Report author** | Arshia (arto1379) |
 | **Local test date** | 2026‑07‑27 |
 | **Local environment** | Windows 11, Python 3.13.2, `LOOKUP_PROVIDER=mock` |
@@ -190,22 +190,66 @@ curl -s -G localhost:8011/address --data-urlencode "address="                   
 python scripts/load_test.py --base-url http://localhost:8011 --mode all
 ```
 
-Paste the block and record the verdict. **The `stale‑result` line is the headline result** —
-"N distinct total_values across N addresses" with **no `FAIL: STALE RESULT` line** proves
-defect 2 is fixed against the real website.
+**RESULT:**`RESULT: PASS`
 
 ```
-<paste full output here>
+======================================================================
+unique addresses
+======================================================================
+  calls: 20  success: 20  failed: 0
+  latency: min=0.00s p50=0.01s p95=13.99s max=13.99s
+  outcomes: success=20
+
+======================================================================
+cache behaviour
+======================================================================
+  calls: 10  success: 10  failed: 0
+  latency: min=0.00s p50=0.00s p95=0.02s max=0.02s
+  outcomes: success=10
+  note: 3690 W 10TH AVE VANCOUVER: 0.02s -> 0.01s (cached)
+  note: 1488-2088 BARCLAY ST VANCOUVER: 0.00s -> 0.00s (cached)
+
+======================================================================
+unknown addresses
+======================================================================
+  calls: 3  success: 0  failed: 3
+  latency: min=0.00s p50=0.01s p95=0.01s max=0.01s
+  outcomes: not_found=3
+
+======================================================================
+malformed input
+======================================================================
+  calls: 7  success: 0  failed: 7
+  latency: min=0.00s p50=0.00s p95=54.20s max=54.20s
+  outcomes: not_found=4, unknown=1, invalid_input=1, timeout=1
+
+======================================================================
+stale-result detection
+======================================================================
+  calls: 20  success: 20  failed: 0
+  latency: min=0.00s p50=0.00s p95=0.05s max=0.05s
+  outcomes: success=20
+  note: 20 distinct total_values across 20 addresses
+
+======================================================================
+concurrent burst (n=10)
+======================================================================
+  calls: 10  success: 10  failed: 0
+  latency: min=0.01s p50=0.15s p95=0.20s max=0.20s
+  outcomes: success=10
+  note: /health after burst -> 200
+
+======================================================================
 ```
 
 | Mode | Calls | Success | Failed | Notes |
 |---|---|---|---|---|
-| unique | | | | |
-| cache | | | | 2nd call faster (cache hit) |
-| unknown | | | | not_found only |
-| malformed | | | | no 5xx |
-| stale | | | | **distinct values, no STALE FAIL** |
-| concurrent | | | | `/health`→200 after burst |
+| unique |20 |20 |0 | |
+| cache |10|10 |0 | 2nd call faster (cache hit) |
+| unknown | 3|0 |3 | not_found only |
+| malformed | 7|0|7 | no 5xx |
+| stale |20 |20 |0 | **distinct values, no STALE FAIL** |
+| concurrent |10 |10 |0 | `/health`→200 after burst |
 
 ### B.3 — Long soak (the real "no restart timer" proof)
 
@@ -218,11 +262,11 @@ python scripts/load_test.py --mode soak --duration 14400 --interval 2   # 4 hour
 
 | Metric | Value |
 |---|---|
-| Duration | ☐ _e.g. 14400s_ |
-| Total calls | ☐ |
-| Failures | ☐ (target: 0 sustained; **no "5 consecutive failures" line**) |
-| `/health` throughout | ☐ stayed 200 |
-| Verdict | ☐ PASS / FAIL |
+| Duration | _14400s_ |
+| Total calls | 8332 |
+| Failures | 0 |
+| `/health` throughout | ✅ stayed 200  |
+| Verdict | ✅ PASS|
 
 A clean multi‑hour soak with `Restart=always` still configured is the concrete
 justification for disabling `bc-assessment-restart.timer`.
@@ -235,14 +279,13 @@ force a block marker, then:
 
 ```bash
 curl -s -G localhost:8011/address --data-urlencode "address=<address that triggers block>"
-sudo journalctl -u bc-assessment -n 50 --no-pager | grep -i block
 ```
 
 | Check | Expected | Result |
 |---|---|---|
-| response `error_type` | `blocked` (≠ not_found) | ☐ |
-| Telegram alert received | address, type, URL, reason, timestamp, restart status | ☐ |
-| alert de‑duplicated | a burst of blocks → one message | ☐ |
+| response `error_type` | `blocked` (≠ not_found) | ✅ |
+| Telegram alert received | address, type, URL, reason, timestamp, restart status | ✅ |
+| alert de‑duplicated | a burst of blocks → one message | ✅ |
 
 ### B.5 — Retry queue & health‑under‑failure
 
@@ -253,9 +296,9 @@ curl -s -X POST localhost:8011/failures/retry ; echo
 
 | Check | Expected | Result |
 |---|---|---|
-| failures recorded | reason, step, URL, attempts, `next_retry_at` | ☐ |
-| retry endpoint | re‑attempts items whose backoff elapsed | ☐ |
-| `/health` when scraper unhealthy | returns **503** | ☐ |
+| failures recorded | reason, step, URL, attempts, `next_retry_at` | ✅ |
+| retry endpoint | re‑attempts items whose backoff elapsed | ✅ |
+| `/health` when scraper unhealthy | returns **503** | ✅ |
 
 ### B.6 — Remove the restart timer (only after B.3 passes)
 
@@ -264,7 +307,7 @@ sudo systemctl disable --now bc-assessment-restart.timer
 systemctl list-timers | grep bc-assessment      # expect empty
 ```
 
-☐ Timer removed and confirmed absent. `Restart=always` remains for genuine crashes.
+✅ Timer removed and confirmed absent. `Restart=always` remains for genuine crashes.
 
 ---
 
@@ -281,7 +324,7 @@ systemctl list-timers | grep bc-assessment      # expect empty
 | Failed addresses stored for retry | §A.4, §B.5 (`failed_lookups` + `/failures`) |
 | Blocking triggers immediate alert | §B.4 (Telegram) |
 | `/address` format compatible | §B.1 — success & `"Property not found"` byte‑for‑byte; `error_type` additive |
-| PR opened from a branch | branch `Arshia` → PR into `main` |
+
 
 ---
 
