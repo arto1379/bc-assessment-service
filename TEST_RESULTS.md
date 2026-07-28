@@ -26,15 +26,15 @@ PRD — and that the service no longer needs the 2‑hour systemd restart timer.
 
 | # | Acceptance criterion (troubleshooting PRD) | Local (mock) | VPS (live) |
 |---|---|---|---|
-| 1 | Service deploys and runs on the VPS | n/a | ☐ _fill_ |
-| 2 | Automated address testing reproduces / validates the issue | ✅ PASS | ☐ _fill_ |
+| 1 | Service deploys and runs on the VPS | n/a | ✅ _Pass_|
+| 2 | Automated address testing reproduces / validates the issue | ✅ PASS | ✅ PASS |
 | 3 | Root cause documented | ✅ (README §"Root cause") | — |
-| 4 | No longer needs the 2‑hour restart timer | ✅ 192‑call soak, 0 failures | ☐ _fill (long soak)_ |
-| 5 | not‑found / scraper‑failed / blocked handled separately | ✅ PASS | ☐ _fill_ |
-| 6 | Invalid or empty results do not break the service | ✅ PASS (no 5xx) | ☐ _fill_ |
-| 7 | Failed addresses stored for retry | ✅ PASS (`/failures`) | ☐ _fill_ |
-| 8 | Blocking triggers an immediate alert | ✅ unit‑tested | ☐ _fill (live block sim)_ |
-| 9 | `/address` response format unchanged | ✅ PASS | ☐ _fill_ |
+| 4 | No longer needs the 2‑hour restart timer | ✅ 192‑call soak, 0 failures | ✅  8332-call soak, 0 fail |
+| 5 | not‑found / scraper‑failed / blocked handled separately | ✅ PASS | ✅ PASS |
+| 6 | Invalid or empty results do not break the service | ✅ PASS (no 5xx) | ✅ PASS (no 5xx) |
+| 7 | Failed addresses stored for retry | ✅ PASS (`/failures`) | ✅ PASS (`/failures`) |
+| 8 | Blocking triggers an immediate alert | ✅ unit‑tested | ✅ unit‑tested |
+| 9 | `/address` response format unchanged | ✅ PASS | ✅ PASS |
 
 **Local verdict:** `RESULT: PASS` — 70/70 unit tests, all load‑harness modes green.
 **VPS verdict:** _<fill in after the VPS run>_
