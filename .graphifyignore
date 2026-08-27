@@ -1,0 +1,33 @@
+# .graphifyignore — extra exclusions for the graphify knowledge graph.
+#
+# gitignore syntax. graphify reads .gitignore first and this file last, and this
+# file can only ever exclude MORE: a `!negation` here cannot re-include something
+# .gitignore already dropped. So everything .gitignore covers — SCRAP/, .venv/,
+# data/, *.db, __pycache__/, .pytest_cache/, .mypy_cache/, .env* — is already out
+# of the corpus and is deliberately not repeated below.
+#
+# graphify-out/ is also absent on purpose: graphify skips its own output dir
+# already, and listing it here risks excluding graphify-out/memory/, which
+# graphify always reads back in.
+#
+# Rule of thumb for adding here: exclude a path if it costs an extraction pass
+# but contributes no node worth querying. Do NOT exclude requirements*.txt —
+# those mint real dependency nodes the graph uses.
+
+# Local agent state. Classified as "code", yields zero nodes, and rewrites itself
+# on every permission change — which re-triggers extraction for nothing.
+.claude/
+
+# Packaging metadata with no extractable symbols; emitted a "produced zero nodes"
+# warning on the full build.
+pyproject.toml
+
+# Scraped HTML debug snapshots (app/config.py: snapshot_dir, default
+# "data/snapshots"). The default lives under the gitignored data/, but the path is
+# configurable via .env — if it is ever pointed elsewhere, these would be ingested
+# as documents and sent to paid semantic extraction. Belt and braces.
+snapshots/
+*.snapshot.html
+how-it-works.html
+README.md
+TEST_RESULT.md
