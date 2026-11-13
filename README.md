@@ -563,8 +563,9 @@ curl -G "http://getplutus.solutions/bc-assessment/address" \
   request could block for up to an hour. Limiters now report `projected_wait()` without
   sleeping and never hold a lock while waiting. `/address` answers `busy` with
   `Retry-After` within about a second once the projected wait exceeds
-  `SCRAPE_MAX_PROJECTED_WAIT_SECONDS`. The longest a live caller waits is now that
-  threshold plus one scrape behind the one in progress.
+  `SCRAPE_MAX_PROJECTED_WAIT_SECONDS`. A live caller now waits at most that threshold for
+  a rate-limit slot, then behind the scrape in progress and any earlier live requests,
+  never behind batch work.
 - Batch de-duplication uses the existing cache key, which normalises case and whitespace
   but not street-type abbreviations (`ST` vs `STREET` are scraped separately).
 - A webhook in flight at shutdown is lost (deliveries are not persisted). The job's result

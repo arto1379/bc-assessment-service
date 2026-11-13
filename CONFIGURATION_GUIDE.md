@@ -32,11 +32,12 @@ where they matter (mainly a Playwright dependency package rename).
 15. [Step 13 — Firewall (ufw)](#step-13--firewall-ufw)
 16. [Step 14 — Telegram alerts (optional but recommended)](#step-14--telegram-alerts-optional-but-recommended)
 17. [Step 15 — Remove the legacy 2-hour restart timer](#step-15--remove-the-legacy-2-hour-restart-timer)
-18. [Connecting this service to another app](#connecting-this-service-to-another-app)
-19. [Day-2 operations (logs, restart, health, retries)](#day-2-operations)
-20. [Environment variable reference](#environment-variable-reference)
-21. [Troubleshooting](#troubleshooting)
-22. [Verification checklist](#verification-checklist)
+18. [Step 16 — Enable batch lookups (optional)](#step-16--enable-batch-lookups-optional)
+19. [Connecting this service to another app](#connecting-this-service-to-another-app)
+20. [Day-2 operations (logs, restart, health, retries, batch)](#day-2-operations)
+21. [Environment variable reference](#environment-variable-reference)
+22. [Troubleshooting](#troubleshooting)
+23. [Verification checklist](#verification-checklist)
 
 ---
 
@@ -58,9 +59,13 @@ to a separate retry queue and never pollute the cache.
 |---|---|
 | `GET /address?address=...` | The main lookup. Returns the property JSON or a classified error. |
 | `GET /health` | Real scraper health. Returns **503** when the browser is unhealthy. |
-| `GET /stats` | Request counters, unresolved failures, cache size. |
+| `GET /stats` | Request counters, unresolved failures, cache size, rate-limit usage, batch counters. |
 | `GET /failures` | Inspect the retry queue. |
 | `POST /failures/retry` | Re-attempt failures whose backoff has elapsed. |
+| `POST /batch` | Submit up to 500 addresses as a background job (off by default — Step 16). |
+| `GET /batch/{job_id}` | Job progress and paginated results. |
+| `DELETE /batch/{job_id}` | Cancel a job's pending items. |
+| `GET /batch/{job_id}/results.csv` | CSV export of a job. |
 
 **Success response shape (this is a contract — do not change it):**
 
@@ -90,7 +95,11 @@ stays exactly `"Property not found"`):
 { "status": "error", "message": "Property not found",            "error_type": "not_found" }
 { "status": "error", "message": "Lookup temporarily unavailable", "error_type": "blocked" }
 { "status": "error", "message": "Lookup timed out",               "error_type": "timeout" }
+{ "status": "error", "message": "Service busy, please retry shortly", "error_type": "busy" }
 ```
+
+`busy` is HTTP 200 like every other `/address` reply, and carries a `Retry-After` header
+(seconds).
 
 ---
 
@@ -291,16 +300,21 @@ The full list is in the [Environment variable reference](#environment-variable-r
 python scripts/setup_db.py
 ```
 
-This creates `data/bc_assessment.db` with the `assessment_cache` and `failed_lookups` tables.
-It is **idempotent and doubles as the migration** — safe to re-run on an existing database; it
-adds `failed_lookups` without touching cached results. Expected output:
+This creates `data/bc_assessment.db` with the `assessment_cache`, `failed_lookups`,
+`batch_jobs` and `batch_items` tables, in WAL mode. It is **idempotent and doubles as the
+migration** — safe to re-run on an existing database; it adds any missing tables without
+touching cached results. Expected output:
 
 ```
 Cache database created: /.../data/bc_assessment.db
-  tables: assessment_cache, failed_lookups
+  tables: assessment_cache, batch_items, batch_jobs, failed_lookups
   cached addresses: 0
   unresolved failures: 0
+  batch jobs: 0
+  journal mode: wal
 ```
+
+On an existing database the first line reads `migrated` instead of `created`.
 
 The `data/` directory is created automatically. Make sure the service user owns it:
 
@@ -555,6 +569,64 @@ If no such timer exists on your box, skip this step.
 
 ---
 
+## Step 16 — Enable batch lookups (optional)
+
+`POST /batch` lets a caller submit up to 500 addresses in one request and collect results
+later, instead of looping over `/address`. It ships **disabled**. The README's "Batch lookups"
+section describes the API in full. This step covers turning it on safely.
+
+**1. Make sure the rate-limiter release is healthy first.** The same release bounds the
+hourly-cap wait for `/address` (callers now get `busy` + `Retry-After` instead of hanging).
+Run with `BATCH_ENABLED=false` for a day and watch:
+
+```bash
+curl -s localhost:8011/stats | python3 -m json.tool    # look at "rate_limit"
+```
+
+**2. Apply the schema** (safe to re-run): `python scripts/setup_db.py`.
+
+**3. Generate an API key** and add the batch settings to `.env`:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+```ini
+BATCH_ENABLED=true
+BATCH_API_KEYS=<the key>            # comma-separate several keys to rotate without downtime
+# Optional webhooks — need BOTH of these, otherwise callers must poll:
+BATCH_WEBHOOK_SECRET=<another random value, shared with the receiver>
+BATCH_CALLBACK_ALLOWED_HOSTS=bluenest.example.com
+```
+
+Leave the other `BATCH_*` values at their defaults unless you have a reason. In particular,
+`BATCH_HOURLY_SHARE=0.7` keeps batch at 350 of the 500 hourly scrapes, so live traffic always
+has headroom. Raising it, or `BC_RATE_LIMIT_HOURLY_MAX`, increases the risk of being
+throttled by bcassessment.ca.
+
+**4. Restart** and smoke-test with a tiny job:
+
+```bash
+sudo systemctl restart bc-assessment
+KEY=<the key>
+curl -s -X POST localhost:8011/batch -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"addresses": ["7009 TISDALL ST VANCOUVER"]}'
+curl -s -H "X-API-Key: $KEY" localhost:8011/batch/<job_id from the reply>
+```
+
+**5. Ramp up.** Run real jobs of 10, then 100, then 500 addresses. Between steps, check
+`curl -s localhost:8011/failures` and the `batch` block of `/stats` for `blocked`. A run of
+blocks pauses all jobs automatically and sends one Telegram alert (Step 14). Jobs resume by
+themselves once BC answers again.
+
+**6. Hand the key to the caller** (e.g. BlueNest) and point its bulk flows at `/batch`.
+
+> **Through nginx:** the `/batch` routes sit beside `/address`, so the existing `location`
+> block already forwards them. The webhook is an *outbound* call from this server; allow
+> outbound HTTPS to the callback host if your firewall restricts egress.
+
+---
+
 ## Connecting this service to another app
 
 The consumer calls the `/address` endpoint over HTTP and reads the JSON. Point it at whichever
@@ -603,7 +675,13 @@ else:
   `error_type == "not_found"` rather than the message if you can.
 - `error_type == "blocked"` or `"timeout"` means *transient* — the caller should retry later, not
   treat the address as nonexistent.
-- `error_type == "busy"` means the service shed load under a queue backlog — retry shortly.
+- `error_type == "busy"` means the service shed load (queue backlog, or the rate limiter
+  projects a wait over `SCRAPE_MAX_PROJECTED_WAIT_SECONDS`). Retry after the number of seconds
+  in the `Retry-After` response header.
+- For more than a handful of addresses, use `POST /batch` (Step 16) instead of looping over
+  `/address`. A loop holds a request open per address and hits `busy` beyond 20 queued
+  requests. A batch job queues the work server-side, is deliberately politer to BC, and
+  survives restarts.
 - Set the client timeout to **at least 30 s**; a first-time live lookup includes browser work.
 - Cache-hit responses are near-instant; only uncached addresses incur the scrape cost and the
   rate-limit spacing (`BC_RATE_LIMIT_MIN_INTERVAL_SECONDS`, default 4 s between BC visits).
@@ -637,7 +715,20 @@ curl -s "localhost:8011/failures?include_resolved=true"
 
 # Re-attempt failures whose backoff has elapsed
 curl -s -X POST "localhost:8011/failures/retry"
+
+# Batch: worker state (paused? why?), jobs/items by state, rate-limit usage per tier
+curl -s localhost:8011/stats | python3 -m json.tool
+
+# Batch: one job's progress, and cancelling a runaway job (keeps results already produced)
+curl -s -H "X-API-Key: $KEY" "localhost:8011/batch/<job_id>?limit=10"
+curl -s -X DELETE -H "X-API-Key: $KEY" "localhost:8011/batch/<job_id>"
+
+# Batch: every log line for one job (lines carry job_id= and idx=)
+sudo journalctl -u bc-assessment --no-pager | grep "job_id=<job_id>"
 ```
+
+Restarting the service is safe while batch jobs run: they resume on startup, losing at most
+the one scrape that was in flight. Finished jobs are purged after `BATCH_RETENTION_DAYS`.
 
 **Updating the code:**
 
@@ -668,12 +759,14 @@ for a hot copy.
 | `BC_RATE_LIMIT_MAX` | `15` | Max scrapes per short window. |
 | `BC_RATE_LIMIT_WINDOW_SECONDS` | `60` | Short rate-limit window. |
 | `BC_RATE_LIMIT_HOURLY_MAX` | `500` | Hourly cap on BC visits. |
+| `BC_RATE_LIMIT_HOURLY_WINDOW_SECONDS` | `3600` | Hourly window. |
 | `BC_RATE_LIMIT_MIN_INTERVAL_SECONDS` | `4` | Minimum spacing between BC requests. |
 | `SCRAPE_WARMUP_ON_START` | `true` | Pre-launch the browser at boot. |
 | `SCRAPE_AUTOCOMPLETE_TIMEOUT_MS` | `8000` | Wait for autocomplete suggestions. |
 | `SCRAPE_RESULT_TIMEOUT_MS` | `25000` | Wait for the property page. |
 | `SCRAPE_TOTAL_TIMEOUT_MS` | `60000` | Hard ceiling on one whole lookup. |
 | `SCRAPE_MAX_QUEUE_DEPTH` | `20` | Queued requests before shedding load (`busy`). |
+| `SCRAPE_MAX_PROJECTED_WAIT_SECONDS` | `30` | `/address` returns `busy` + `Retry-After` instead of waiting longer than this for a rate-limit slot. |
 | `BROWSER_MAX_LOOKUPS` | `200` | Recycle the browser after N lookups (`0` = never). |
 | `BROWSER_RESTART_AFTER_FAILURES` | `3` | Recycle after N consecutive failures. |
 | `UNHEALTHY_AFTER_FAILURES` | `5` | Failures before `/health` returns 503. |
@@ -683,6 +776,17 @@ for a hot copy.
 | `TELEGRAM_CHAT_IDS` | _(empty)_ | Comma-separated chat IDs. |
 | `STATS_MILESTONE_COUNT` | `100` | Reset counters and alert at this many calls. |
 | `ALERT_MIN_INTERVAL_SECONDS` | `300` | Minimum gap between repeat alerts of one type. |
+| `BATCH_ENABLED` | `false` | Feature flag for `/batch` (503 when off). |
+| `BATCH_API_KEYS` | _(empty)_ | Comma-separated keys accepted in `X-API-Key`. Empty = nobody gets in. Set in `.env` only. |
+| `BATCH_MAX_ADDRESSES` | `500` | Addresses per job. |
+| `BATCH_MAX_ACTIVE_JOBS` | `3` | Active jobs before `429`. |
+| `BATCH_MAX_PENDING_ITEMS` | `2000` | Pending items service-wide before `429`. |
+| `BATCH_HOURLY_SHARE` | `0.7` | Fraction of the hourly cap batch may use (350 of 500). |
+| `BATCH_ITEM_MAX_ATTEMPTS` | `3` | Attempts per item before it is `failed`. |
+| `BATCH_PAUSE_AFTER_BLOCKED` | `3` | Consecutive `blocked` results before jobs pause. |
+| `BATCH_RETENTION_DAYS` | `7` | Age at which finished jobs are purged. |
+| `BATCH_WEBHOOK_SECRET` | _(empty)_ | HMAC key for webhook signatures. Empty disables webhooks. |
+| `BATCH_CALLBACK_ALLOWED_HOSTS` | _(empty)_ | Comma-separated webhook hosts. Empty disables webhooks. |
 
 ---
 
@@ -755,11 +859,16 @@ healthy. A restart is only a manual reset.
 
 ### Requests hang / clients time out under load
 
-- A capped-out **hourly** rate-limit wait is not bounded and can block for up to an hour at the
-  cap (documented limitation). Callers beyond `SCRAPE_MAX_QUEUE_DEPTH` get a fast `busy` instead
-  of hanging — so if clients hang rather than getting `busy`, you are below the queue depth and
-  simply waiting on the rate limiter. Lower request volume or raise the caps cautiously
-  (`BC_RATE_LIMIT_HOURLY_MAX`) — but raising them risks getting blocked by BC.
+- The rate-limit wait is bounded. A request whose projected wait exceeds
+  `SCRAPE_MAX_PROJECTED_WAIT_SECONDS` (default 30 s) gets `busy` with `Retry-After` within
+  about a second, and callers beyond `SCRAPE_MAX_QUEUE_DEPTH` get `busy` immediately. A
+  caller that is not shed waits at most that threshold for a rate-limit slot, then for the
+  scrape in progress and any live requests that arrived before it. Batch work never gets
+  ahead of a waiting live request. If clients see a lot of `busy`, look at
+  `/stats` → `rate_limit`: the hourly tier is probably full. Lower request volume, or move
+  bulk callers to `/batch`. Raising `BC_RATE_LIMIT_HOURLY_MAX` risks getting blocked by BC.
+- An older build (before the batch release) could block for up to an hour at the hourly cap.
+  If you see that, you are running old code.
 - Make sure your nginx `proxy_read_timeout` (Step 11, `120s`) is **longer** than the app's
   `SCRAPE_TOTAL_TIMEOUT_MS` (default 60s), or nginx will 504 before the app can respond.
 
@@ -822,6 +931,40 @@ curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" \
 If that fails, the token/chat id is wrong. You must have messaged the bot at least once from that
 chat before it can send to you.
 
+### `/batch` returns 503 or 401
+
+- **503 `Batch lookups are disabled`** — `BATCH_ENABLED` is not `true` in `.env`, or the service
+  was not restarted after editing it.
+- **401 `Missing or invalid X-API-Key`** — the header is missing, or its value is not one of the
+  comma-separated `BATCH_API_KEYS`. With `BATCH_API_KEYS` empty, every request is refused.
+- **429** — more than `BATCH_MAX_ACTIVE_JOBS` jobs are active or `BATCH_MAX_PENDING_ITEMS` items
+  are pending. Wait for jobs to finish, or cancel one with `DELETE /batch/{job_id}`.
+
+### A batch job is stuck in `paused`
+
+`paused_reason` says why (e.g. `blocked: 3 consecutive blocked results`). BC Assessment is
+challenging the scraper. Follow "Every lookup returns 'Property not found'" above. The worker
+probes one item every 30 s, doubling to 15 min, and resumes on its own as soon as a probe, or
+any live `/address` lookup, succeeds. `/stats` → `batch` shows `paused`, `paused_reason` and
+`blocked_streak`. A restart also resumes paused jobs immediately; if BC is still blocking
+they pause again after `BATCH_PAUSE_AFTER_BLOCKED` blocks.
+
+### A batch job is slow
+
+That is by design. Batch is held to `BATCH_HOURLY_SHARE` of the hourly cap (350/hour) and the
+4 s spacing, and every live `/address` request goes ahead of it, so sustained live traffic
+slows jobs further. Nothing is lost. `estimated_seconds` on submit is a lower bound.
+
+### A webhook never arrives
+
+- Submits with a `callback_url` get `400` unless **both** `BATCH_WEBHOOK_SECRET` and
+  `BATCH_CALLBACK_ALLOWED_HOSTS` are set and the URL is `https://` on an allowlisted host.
+- `journalctl -u bc-assessment | grep webhook` shows each attempt. `HTTP 3xx …redirects are not
+  followed` means the receiver redirected: give it the final URL. `resolves to a non-public
+  address` means the host points at a private IP, which is refused on purpose.
+- The receiver must answer 2xx within 5 s. Failed deliveries are retried 3 times and then
+  dropped. The job's results are still available through `GET /batch/{job_id}`.
+
 ### Run the automated tests / load harness
 
 ```bash
@@ -830,10 +973,14 @@ pytest                                                     # full suite (uses mo
 python scripts/load_test.py --base-url http://localhost:8011 --mode all
 python scripts/load_test.py --mode stale                   # stale-result regression check
 python scripts/load_test.py --mode soak --duration 14400   # 4-hour soak
+python scripts/load_test.py --mode batch --api-key "$KEY"  # batch end to end + stale check
+python scripts/load_test.py --mode mixed --api-key "$KEY"  # /address p95 while a batch runs
 ```
 
 The `stale` mode is the direct regression test for the old data-corruption bug: it asserts that
-distinct addresses never return the same `total_value`.
+distinct addresses never return the same `total_value`. `--mode batch` applies the same check
+across a batch job. The batch modes submit synthetic addresses unless you pass
+`--addresses-file`, so on the live provider always pass a file of real addresses.
 
 ---
 
@@ -855,4 +1002,13 @@ Deployment is complete when all of these pass:
 - [ ] Telegram alerts are configured (token + chat id in `.env`).
 - [ ] The legacy 2-hour restart timer is disabled.
 - [ ] The consuming app is pointed at the correct `/address` URL and gets a success response.
+
+If batch lookups are enabled (Step 16):
+
+- [ ] `python scripts/setup_db.py` lists `batch_items, batch_jobs` and `journal mode: wal`.
+- [ ] `POST /batch` without `X-API-Key` returns 401; with the key it returns 202 and a `job_id`.
+- [ ] The job reaches `completed` and its items carry the same `result` fields as `/address`.
+- [ ] `/stats` shows `"batch": {"enabled": true, "worker_running": true, "paused": false, ...}`.
+- [ ] Restarting the service mid-job leaves the job finishing on its own.
+- [ ] If webhooks are configured, the receiver gets a POST whose `X-BC-Signature` verifies.
 ```
