@@ -14,6 +14,7 @@ from app.schemas import (
     FailureType,
     SuccessResponse,
 )
+from app.services.batch import batch_worker
 from app.services.browser import browser_manager
 from app.services.lookup import (
     lookup_by_address,
@@ -48,9 +49,13 @@ _FAILURE_MESSAGES = {
 async def lifespan(_app: FastAPI):
     init_db()
     await warmup_browser()
+    if settings.batch_enabled:
+        # Resumes any job left unfinished by a restart.
+        await batch_worker.start()
     try:
         yield
     finally:
+        await batch_worker.stop()
         await shutdown_browser()
         await flush_pending()
         close_connection()

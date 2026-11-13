@@ -45,8 +45,12 @@ _queue_depth = 0
 _queue_lock = asyncio.Lock()
 
 
-def _normalize_address(address: str) -> str:
+def normalize_address(address: str) -> str:
+    """Cache key: upper-cased, whitespace collapsed. Batch de-duplicates on it too."""
     return re.sub(r"\s+", " ", address.strip().upper())
+
+
+_normalize_address = normalize_address
 
 
 # ---------------------------------------------------------------------------
@@ -190,30 +194,54 @@ async def _run_scrape(address: str, *, batch: bool = False) -> LookupOutcome:
 # ---------------------------------------------------------------------------
 
 
-async def lookup_by_address(address: str) -> LookupOutcome:
-    """Return assessment data for an address, or a classified failure."""
-    if not address or not address.strip():
-        logger.warning("lookup_by_address: empty address")
-        notify_no_address(address or "")
-        return LookupOutcome.failed(FailureType.NOT_FOUND, "empty address")
+async def cached_outcome(address: str) -> Optional[LookupOutcome]:
+    """Answer from the positive or negative cache, or None on a miss.
 
-    address = address.strip()
-    normalized = _normalize_address(address)
-    logger.info("lookup address=%r normalized=%r", address, normalized)
+    Shared by /address, batch submit (cache-first) and the batch worker's
+    re-check before each scrape.
+    """
+    normalized = normalize_address(address)
 
     # 1. Positive cache.
     cached = await asyncio.to_thread(cache_get, normalized)
     if cached is not None and is_valid_assessment(cached):
         logger.info("cache hit address=%r", normalized)
         await record_cache_hit(address)
-        return LookupOutcome.success(cached)
+        outcome = LookupOutcome.success(cached)
+        outcome.source = "cache"
+        return outcome
 
     # 2. Negative cache — a recent, genuine "not found".
     negative = await asyncio.to_thread(failures.get_negative_cache, normalized)
     if negative is not None:
         logger.info("negative cache hit address=%r (%s)", normalized, negative)
         await record_cache_hit(address)
-        return LookupOutcome.failed(FailureType.NOT_FOUND, negative)
+        outcome = LookupOutcome.failed(FailureType.NOT_FOUND, negative)
+        outcome.source = "cache"
+        return outcome
+
+    return None
+
+
+async def lookup_by_address(address: str, *, batch: bool = False) -> LookupOutcome:
+    """Return assessment data for an address, or a classified failure.
+
+    `batch=True` is the batch worker's path: same cache, scrape, validation and
+    recording, but it yields to live traffic, uses the batch rate share, waits
+    instead of answering busy, and leaves per-address alerts to the batch layer.
+    """
+    if not address or not address.strip():
+        logger.warning("lookup_by_address: empty address")
+        notify_no_address(address or "")
+        return LookupOutcome.failed(FailureType.NOT_FOUND, "empty address")
+
+    address = address.strip()
+    normalized = normalize_address(address)
+    logger.info("lookup address=%r normalized=%r batch=%s", address, normalized, batch)
+
+    hit = await cached_outcome(address)
+    if hit is not None:
+        return hit
 
     # 3. Scrape. Counted before dispatch so the counter reflects every call that
     # reached the provider, which is what the cache is meant to avoid.
@@ -221,16 +249,22 @@ async def lookup_by_address(address: str) -> LookupOutcome:
     if settings.lookup_provider.lower() == "mock":
         outcome = _mock_lookup(address)
     else:
-        outcome = await _run_scrape(address)
+        outcome = await _run_scrape(address, batch=batch)
+    outcome.source = "scrape"
 
-    await _record_outcome(address, normalized, outcome)
+    await _record_outcome(address, normalized, outcome, batch=batch)
     return outcome
 
 
 async def _record_outcome(
-    address: str, normalized: str, outcome: LookupOutcome
+    address: str, normalized: str, outcome: LookupOutcome, *, batch: bool = False
 ) -> None:
-    """Persist and alert on the result of a scrape."""
+    """Persist and alert on the result of a scrape.
+
+    For batch scrapes, not_found and blocked are not alerted per address: a
+    500-address import would otherwise send hundreds of messages. The batch
+    worker sends one alert when repeated blocks pause the job instead.
+    """
     if outcome.ok and outcome.result is not None:
         browser_manager.record_success()
         await asyncio.to_thread(cache_set, normalized, outcome.result)
@@ -269,6 +303,8 @@ async def _record_outcome(
         outcome.restarted,
     )
 
+    if batch and failure in (FailureType.NOT_FOUND, FailureType.BLOCKED):
+        return
     if failure is FailureType.NOT_FOUND:
         notify_not_found(address)
     else:

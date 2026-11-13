@@ -71,6 +71,7 @@ def create_job(
     client_ref: Optional[str],
     callback_url: Optional[str],
     items: list[dict[str, Any]],
+    paused_reason: Optional[str] = None,
 ) -> None:
     """Insert a job and all of its items in one transaction."""
     now = now_iso()
@@ -80,7 +81,7 @@ def create_job(
             """
             INSERT INTO batch_jobs (id, state, total, client_ref, callback_url,
                                     paused_reason, created_at, updated_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -88,6 +89,7 @@ def create_job(
                 len(items),
                 client_ref,
                 callback_url,
+                paused_reason,
                 now,
                 now,
                 now if state == COMPLETED else None,
