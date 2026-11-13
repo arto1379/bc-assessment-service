@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.routes import batch as batch_routes
+from app.db import batch as batch_db
 from app.db import failures as failures_db
 from app.db.cache import cache_count
 from app.db.connection import close_connection, init_db
@@ -25,6 +26,7 @@ from app.services.lookup import (
     shutdown_browser,
     warmup_browser,
 )
+from app.services.rate_limit import bc_rate_limiter
 from app.services.stats import get_stats
 from app.services.telegram_notify import flush_pending
 
@@ -142,6 +144,14 @@ async def stats():
     base = await get_stats()
     base["unresolved_failures"] = failures_db.failure_counts()
     base["cached_addresses"] = cache_count()
+    # Additive keys: rate-limit usage per tier (incl. the batch share) and batch
+    # job/item counts plus worker state.
+    base["rate_limit"] = bc_rate_limiter.snapshot()
+    base["batch"] = {
+        "enabled": settings.batch_enabled,
+        **batch_worker.stats(),
+        **batch_db.counts(),
+    }
     return base
 
 
