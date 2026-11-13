@@ -14,6 +14,11 @@ PRD — and that the service no longer needs the 2‑hour systemd restart timer.
 | **VPS test date** | _<fill in>_ |
 | **VPS environment** | _<Ubuntu 22.04 / vCPU / RAM>_, Python 3.x, `LOOKUP_PROVIDER=live` |
 
+> **Update (2026‑11‑13, branch `Multi_input_feature`):** the Batch Address Lookup PRD
+> (`POST /batch`, the bounded rate-limit wait, the priority scrape slot) has its own
+> verification in [§7](#7-batch-address-lookup-prd--verification). Parts A and B below are
+> the original troubleshooting report, kept as they were run at `279fd26`.
+
 > This report has two halves. **Part A (local)** is complete and reproducible on any
 > machine with no browser or network — the numbers below are real output from this commit.
 > **Part B (VPS, live)** is the deployment run the reviewer asked for; run the commands and
@@ -342,6 +347,116 @@ LOOKUP_PROVIDER=mock SCRAPE_WARMUP_ON_START=false py -m uvicorn app.main:app --h
 py scripts/load_test.py --base-url http://127.0.0.1:8011 --mode all
 py scripts/load_test.py --base-url http://127.0.0.1:8011 --mode soak --duration 60 --interval 0.3
 ```
+
+---
+
+## 7. Batch Address Lookup PRD — verification
+
+| | |
+|---|---|
+| **Branch** | `Multi_input_feature` |
+| **Local test date** | 2026‑11‑13 |
+| **Local environment** | Windows 11, Python 3.13.2, `LOOKUP_PROVIDER=mock` |
+| **VPS / live run** | ☐ _to run — see §7.4_ |
+
+### 7.1 — Unit & integration suite
+
+```
+$ pytest -q
+153 passed
+```
+
+That is 69 of the original 70 tests unchanged, plus 84 new. One original test,
+`test_a_capped_out_wait_still_serialises_callers`, was **replaced on purpose**: it asserted
+that waiters serialise on the rate limiter's own lock, which is the unbounded-wait
+behaviour this PRD removes. Its replacement, `test_waiters_do_not_hold_a_lock_while_sleeping`,
+asserts the opposite.
+
+The suite was also run 30 times back to back to flush out races (see §7.3).
+
+| File | Tests | Covers |
+|---|---|---|
+| `test_concurrency.py` | 22 | Projected wait; busy + Retry‑After; live overtakes 50 queued batch items; batch ≤ 350/hour on a fake clock; no lock held while sleeping |
+| `test_batch_api.py` | 31 | Validation (400), auth (401), flag (503), limits (429), de‑duplication, cache‑first, pagination, cancel, CSV, `/address` byte‑for‑byte |
+| `test_batch_worker.py` | 20 | Retry/backoff, circuit breaker pause → probe → resume with one alert, restart mid‑job, scrape sharing, purge, 500 cached < 5 s |
+| `test_webhook.py` | 16 | HMAC signature, allowlist rejection, refused redirects, retries, private‑address refusal |
+| `test_cache.py` (+2) | 10 | Concurrent reads from 8 threads never cross rows (regression, see §7.3) |
+
+### 7.2 — Acceptance criteria (PRD)
+
+| PRD acceptance criterion | Local (mock) | Evidence |
+|---|---|---|
+| All P0 and P1 requirements covered by passing tests | ✅ | §7.1 (B1–B18 each have tests; B18 CSV is P2 and is also covered) |
+| 500 cached addresses resolve in under 5 s | ✅ | `test_500_cached_addresses_resolve_in_under_5_seconds`; harness re‑submit a re-submit of 500 resolved addresses came back `completed`, `cached=500`, in 0.06 s |
+| Kill mid‑job, restart, every item finishes, none scraped twice | ✅ | §7.3 kill test: 3 × 500 items, 181 pending at kill, 1500/1500 done, **0** scraped twice |
+| `/address` p95 with a batch running ≤ 1.5× idle | ✅ mock / ☐ live | `--mode mixed`: p95 0.002 s idle vs 0.003 s during a 500-address batch, no `busy`. Mock latencies are sub‑millisecond, so the live run is what counts |
+| At the hourly cap, `/address` returns busy + Retry‑After within 1 s | ✅ | `test_acquire_with_max_wait_returns_promptly_instead_of_hanging`, `test_run_scrape_returns_busy_with_retry_after_over_threshold` |
+| Simulated block pauses the job, one alert, resumes after recovery | ✅ | `test_consecutive_blocks_pause_once_and_a_probe_resumes` |
+| Live run of 100 addresses: no `blocked`, ≤ 350 scrapes per rolling hour | ☐ live | §7.4. The 350 cap itself is unit‑tested (`test_batch_never_exceeds_its_hourly_share`) |
+| `/address` success response byte‑for‑byte unchanged | ✅ | `test_address_success_response_is_byte_for_byte_unchanged` |
+| Distinct addresses never share a `total_value` in a batch | ✅ | `--mode batch`: 499 distinct `total_value`s across 499 found addresses (plus 1 `not_found`) |
+
+### 7.3 — What the extra runs found (and fixed)
+
+Two real defects showed up only under load. Neither appeared in a single test run.
+
+1. **Shared SQLite connection across threads.** The kill/restart run hit
+   `IndexError: tuple index out of range` in `cache_get`: batch submit and the worker read
+   at the same time on the one process‑wide connection, and one received the other's row.
+   This could already happen with concurrent `/address` requests; batch made it frequent.
+   **Fix:** one connection per thread (`ebe6434`). A regression test fails on the old code.
+   The same run showed that an exception during a lookup could leave an item stuck "in
+   flight" until restart; that is fixed too (`ac55b04`).
+2. **`estimated_seconds` race.** In roughly 1 of every 15–20 full runs, a fast worker finished a job
+   before `submit` computed the estimate, which then came back as `0`. **Fix:** the estimate
+   is computed from the queue before the worker is woken (`ac55b04`).
+
+**Kill test (mock, real server):** three 500‑address jobs submitted, the process hard‑killed
+(`Stop-Process -Force`) while 181 items were still pending, then restarted on the same
+database:
+
+```
+after kill items: [('done', 1319), ('pending', 181)]
+after kill jobs:  [('completed', 2), ('running', 1)]
+<restart>
+7639e0a5a4a713e4 completed {'done': 500, 'not_found': 0, 'failed': 0, 'pending': 0, 'cancelled': 0}
+94903003c6cdbade completed {'done': 500, 'not_found': 0, 'failed': 0, 'pending': 0, 'cancelled': 0}
+fb0eb4d373026291 completed {'done': 500, 'not_found': 0, 'failed': 0, 'pending': 0, 'cancelled': 0}
+addresses scraped: 1499  scraped more than once: 0
+```
+
+The 1,500th address shows as a cache hit after the restart: its scrape reached the cache
+just before the kill, and the worker's cache re‑check picked it up. That is the PRD's
+"a restart loses at most the scrape in flight", working as intended.
+
+### 7.4 — Load harness (mock) and the live run still to do
+
+Server: `LOOKUP_PROVIDER=mock BATCH_ENABLED=true BATCH_API_KEYS=… uvicorn app.main:app`.
+
+```
+$ python scripts/load_test.py --base-url http://127.0.0.1:8099 --mode all --api-key KEY --batch-size 500
+unique addresses      : calls 20  success 20  failed 0   (success=20)
+cache behaviour       : calls 10  success 10  failed 0   (success=10)
+unknown addresses     : calls  3  success  0  failed 3   (not_found=3)
+malformed input       : calls  7  success  5  failed 2   (no 5xx)
+stale-result detection: calls 20  success 20  failed 0   (20 distinct total_values across 20 addresses)
+concurrent burst n=10 : calls 10  success 10  failed 0   (/health after burst -> 200)
+batch (500 addresses) : total=500 unique=500 cached=1 pending_scrape=499, submit 0.06s
+                        completed in 1.1s: done=499 not_found=1 failed=0
+                        499 distinct total_values; re-submit completed, cached=500, in 0.06s
+mixed                 : 500-address batch running; /address p95 idle=0.002s during=0.003s, no busy
+RESULT: PASS
+```
+
+**Still to run on the VPS (live provider)**, following the README rollout:
+
+1. Release with `BATCH_ENABLED=false`; after a day, record `/stats` → `rate_limit`.
+2. `python scripts/setup_db.py`, enable, then run real jobs of 10, 100 and 500 addresses with
+   `--addresses-file`, checking `/failures` and `/stats` → `batch` for `blocked` between steps.
+3. `python scripts/load_test.py --mode mixed --api-key "$KEY" --addresses-file real.txt` and
+   record idle vs. during‑batch p95 (target ≤ 1.5×).
+4. During the 100‑address run, confirm `/stats` → `rate_limit.tiers["BC hourly (batch)"].used`
+   never exceeds 350 and no item ends `failed:blocked`.
 
 ---
 

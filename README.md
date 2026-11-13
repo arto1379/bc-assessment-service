@@ -261,8 +261,10 @@ items service-wide, `503` `BATCH_ENABLED` is false. Error bodies use the usual
   every active job is `paused` with a `paused_reason`, and one Telegram alert is sent
   (de-duplicated by `ALERT_MIN_INTERVAL_SECONDS`). The worker then probes one item at a time
   at growing intervals (30 s, doubling, up to 15 min). A probe that is still blocked costs
-  the item no attempt. Jobs resume, with a "resumed" alert, when a probe succeeds or when any
-  live `/address` lookup has succeeded since the pause. Jobs submitted during a pause start
+  the item no attempt. Jobs resume, with a "resumed" alert, when a probe gets an answer from
+  BC (a result or a genuine not-found) or when any live `/address` lookup has succeeded
+  since the pause. A probe that times out or errors does not resume them; the interval
+  keeps growing. Jobs submitted during a pause start
   `paused`. Per-address `not_found` and `blocked` alerts are not sent for batch items, so a
   500-address import cannot flood Telegram.
 - **Restarts.** Results are written per item. On startup, items that were in flight return
@@ -428,8 +430,9 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-148 tests covering parsing, block detection, cache behaviour (including that invalid
-results are never cached), the retry queue and negative cache, browser recycling policy,
+153 tests covering parsing, block detection, cache behaviour (including that invalid
+results are never cached, and that concurrent reads from many threads never cross rows),
+the retry queue and negative cache, browser recycling policy,
 alert de-duplication, the full API surface, and batch lookups. They run against the `mock`
 provider, so no browser and no network are required.
 
