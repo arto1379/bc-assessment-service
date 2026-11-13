@@ -16,12 +16,20 @@ Usage:
 
     python scripts/load_test.py --base-url http://localhost:8011 --mode all
     python scripts/load_test.py --mode soak --duration 14400   # 4h soak
+    python scripts/load_test.py --mode batch --api-key KEY     # batch + stale check
+    python scripts/load_test.py --mode mixed --api-key KEY     # /address p95 during a batch
+
+Batch modes need the service started with BATCH_ENABLED=true and the key in
+BATCH_API_KEYS (or pass it via the BATCH_API_KEY environment variable). Without
+--addresses-file they submit synthetic addresses, which is right for the mock
+provider; against the live provider pass a file of real addresses.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import statistics
 import sys
 import time
@@ -296,6 +304,163 @@ async def mode_soak(
     return report
 
 
+def synthetic_addresses(count: int, tag: str) -> list[str]:
+    return [f"{n} {tag} LOADTEST ST VANCOUVER" for n in range(1, count + 1)]
+
+
+async def run_batch(
+    client: httpx.AsyncClient,
+    addresses: list[str],
+    api_key: str,
+    report: Report,
+    max_wait: float,
+) -> Optional[dict[str, Any]]:
+    """Submit a job and poll it to a terminal state; returns all items."""
+    headers = {"X-API-Key": api_key}
+    started = time.monotonic()
+    response = await client.post("/batch", json={"addresses": addresses}, headers=headers)
+    if response.status_code != 202:
+        report.fail(f"submit returned {response.status_code}: {response.text[:200]}")
+        return None
+    submitted = response.json()["data"]
+    report.add_note(
+        f"submitted job {submitted['job_id']}: total={submitted['total']} "
+        f"unique={submitted['unique']} cached={submitted['cached']} "
+        f"pending_scrape={submitted['pending_scrape']} "
+        f"estimated={submitted['estimated_seconds']}s "
+        f"(submit took {time.monotonic() - started:.2f}s)"
+    )
+
+    job_id = submitted["job_id"]
+    deadline = started + max_wait
+    while True:
+        status = (
+            await client.get(f"/batch/{job_id}", params={"limit": 1}, headers=headers)
+        ).json()["data"]
+        if status["state"] in ("completed", "cancelled") or time.monotonic() > deadline:
+            break
+        await asyncio.sleep(1.0)
+
+    if status["state"] != "completed":
+        report.fail(
+            f"job {job_id} not completed after {max_wait:.0f}s "
+            f"(state={status['state']}, progress={status['progress']}, "
+            f"paused_reason={status['paused_reason']})"
+        )
+    report.add_note(
+        f"job {job_id} {status['state']} in {time.monotonic() - started:.1f}s: "
+        f"{status['progress']}"
+    )
+
+    items: list[dict[str, Any]] = []
+    offset: Optional[int] = 0
+    while offset is not None:
+        page = (
+            await client.get(
+                f"/batch/{job_id}", params={"offset": offset, "limit": 500}, headers=headers
+            )
+        ).json()["data"]
+        items.extend(page["items"])
+        offset = page["next_offset"]
+    status["items"] = items
+    return status
+
+
+async def mode_batch(
+    client: httpx.AsyncClient, addresses: list[str], api_key: str, max_wait: float
+) -> Report:
+    """Batch end to end, plus the stale-result check run through a batch."""
+    report = Report(f"batch ({len(addresses)} addresses)")
+    job = await run_batch(client, addresses + UNKNOWN_ADDRESSES[:1], api_key, report, max_wait)
+    if job is None:
+        return report
+
+    outcomes = Counter(
+        f"{i['state']}:{i['error_type']}" if i["error_type"] else i["state"]
+        for i in job["items"]
+    )
+    report.add_note("item outcomes: " + ", ".join(f"{k}={v}" for k, v in outcomes.most_common()))
+    if job["state"] == "completed" and any(i["state"] == "pending" for i in job["items"]):
+        report.fail("items left pending in a completed job")
+
+    # The stale-result regression check, run through a batch.
+    seen: dict[str, str] = {}
+    for item in job["items"]:
+        value = (item.get("result") or {}).get("total_value")
+        if not value:
+            continue
+        key = " ".join(item["address"].upper().split())
+        if value in seen and seen[value] != key:
+            report.fail(
+                f"STALE RESULT in batch: {item['address']!r} returned {value} - "
+                f"also returned for {seen[value]!r}"
+            )
+        seen.setdefault(value, key)
+    report.add_note(f"{len(seen)} distinct total_values in the batch")
+
+    # Re-submitting must be answered entirely from cache at submit time.
+    started = time.monotonic()
+    again = await client.post(
+        "/batch", json={"addresses": addresses}, headers={"X-API-Key": api_key}
+    )
+    data = again.json().get("data", {})
+    report.add_note(
+        f"re-submit: state={data.get('state')} cached={data.get('cached')} "
+        f"in {time.monotonic() - started:.2f}s"
+    )
+    all_resolved = all(i["state"] in ("done", "not_found") for i in job["items"])
+    if all_resolved and data.get("state") != "completed":
+        report.fail("re-submitting resolved addresses was not answered from cache")
+    return report
+
+
+async def mode_mixed(
+    client: httpx.AsyncClient,
+    probes: list[str],
+    batch_addresses: list[str],
+    api_key: str,
+    max_wait: float,
+) -> Report:
+    """/address p95 while a batch runs must stay within 1.5x the idle p95."""
+    report = Report(f"mixed (/address during a {len(batch_addresses)}-address batch)")
+    half = max(len(probes) // 2, 1)
+    idle_probes, busy_probes = probes[:half], probes[half:] or probes[:half]
+
+    idle = [await call_address(client, a) for a in idle_probes]
+    report.calls.extend(idle)
+
+    task = asyncio.create_task(run_batch(client, batch_addresses, api_key, report, max_wait))
+    await asyncio.sleep(1.0)  # let the worker start scraping
+    during: list[Call] = []
+    for address in busy_probes:
+        if task.done():
+            break
+        during.append(await call_address(client, address))
+    report.calls.extend(during)
+    await task
+
+    def p95(calls: list[Call]) -> float:
+        data = sorted(c.elapsed for c in calls)
+        return data[min(int(len(data) * 0.95), len(data) - 1)] if data else 0.0
+
+    idle_p95, busy_p95 = p95(idle), p95(during)
+    # Floor the baseline so sub-millisecond mock latencies do not turn the
+    # ratio into noise.
+    baseline = max(idle_p95, 0.05)
+    report.add_note(
+        f"/address p95 idle={idle_p95:.3f}s during batch={busy_p95:.3f}s "
+        f"({len(during)} calls during the batch)"
+    )
+    if not during:
+        report.add_note("batch finished before any probe ran; use a larger --batch-size")
+    elif busy_p95 > 1.5 * baseline:
+        report.fail(f"/address p95 during batch {busy_p95:.3f}s > 1.5x idle {baseline:.3f}s")
+    busy = [c for c in during if c.error_type == "busy"]
+    if busy:
+        report.fail(f"{len(busy)} /address calls answered busy while a batch ran")
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -336,13 +501,25 @@ async def main() -> int:
     parser.add_argument(
         "--mode",
         default="all",
-        choices=["all", "unique", "cache", "unknown", "malformed", "concurrent", "stale", "soak"],
+        choices=[
+            "all", "unique", "cache", "unknown", "malformed", "concurrent", "stale",
+            "soak", "batch", "mixed",
+        ],
     )
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--burst", type=int, default=10)
     parser.add_argument("--duration", type=float, default=600.0, help="soak seconds")
     parser.add_argument("--interval", type=float, default=2.0, help="soak gap seconds")
     parser.add_argument("--addresses-file", help="newline-separated addresses")
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("BATCH_API_KEY", ""),
+        help="X-API-Key for batch modes (default: the BATCH_API_KEY env var)",
+    )
+    parser.add_argument("--batch-size", type=int, default=100, help="synthetic batch size")
+    parser.add_argument(
+        "--batch-max-wait", type=float, default=900.0, help="seconds to wait for a job"
+    )
     args = parser.parse_args()
 
     addresses = DEFAULT_ADDRESSES
@@ -374,6 +551,28 @@ async def main() -> int:
             reports.append(await mode_stale(client, addresses))
         if run in ("all", "concurrent"):
             reports.append(await mode_concurrent(client, addresses, args.burst))
+        batch_addresses = (
+            addresses if args.addresses_file else synthetic_addresses(args.batch_size, "BATCH")
+        )
+        if run in ("batch", "mixed") and not args.api_key:
+            print("Batch modes need --api-key (or the BATCH_API_KEY env var)")
+            return 2
+        if run == "all" and not args.api_key:
+            print("Skipping batch modes: no --api-key given")
+        if run in ("all", "batch") and args.api_key:
+            reports.append(
+                await mode_batch(client, batch_addresses, args.api_key, args.batch_max_wait)
+            )
+        if run in ("all", "mixed") and args.api_key:
+            mixed_batch = (
+                batch_addresses
+                if args.addresses_file
+                else synthetic_addresses(args.batch_size, "MIXED")
+            )
+            probes = addresses if args.addresses_file else synthetic_addresses(20, "PROBE")
+            reports.append(
+                await mode_mixed(client, probes, mixed_batch, args.api_key, args.batch_max_wait)
+            )
         if run == "soak":
             reports.append(
                 await mode_soak(client, addresses, args.duration, args.interval)
