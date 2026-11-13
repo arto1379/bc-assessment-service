@@ -279,6 +279,12 @@
         <li><a href="#scraper"><code>services/scraper.py</code></a></li>
         <li><a href="#ratelimit"><code>services/rate_limit.py</code></a></li>
 
+        <li class="group">Batch lookups</li>
+        <li><a href="#batch"><code>services/batch.py</code></a></li>
+        <li><a href="#gate"><code>services/scrape_gate.py</code></a></li>
+        <li><a href="#webhook"><code>services/webhook.py</code></a></li>
+        <li><a href="#batchroutes"><code>routes/batch.py</code> · <code>db/batch.py</code></a></li>
+
         <li class="group">Persistence</li>
         <li><a href="#connection"><code>db/connection.py</code></a></li>
         <li><a href="#cache"><code>db/cache.py</code></a></li>
@@ -330,8 +336,8 @@
         <div class="step"><h4>Validate &amp; normalize — <code>lookup_by_address()</code></h4><p>Trim the address; reject empty input early. Normalize to upper-case, single-spaced text so <code class="ic">"7009  tisdall st"</code> and <code class="ic">"7009 TISDALL ST"</code> share one cache key.</p></div>
         <div class="step"><h4>Positive cache — <code>cache_get()</code></h4><p>A hit on a valid, unexpired row returns immediately. No browser, no network, no rate-limit cost. This is the whole point of the cache.</p></div>
         <div class="step"><h4>Negative cache — <code>get_negative_cache()</code></h4><p>If this exact address was recently confirmed <em>not found</em>, return that without re-scraping. Unknown addresses otherwise burn the rate-limit budget on every request.</p></div>
-        <div class="step"><h4>Rate limit — <code>bc_rate_limiter.acquire()</code></h4><p>Wait for the minimum spacing and window/hourly caps <strong>before</strong> taking the scrape lock. Acquiring it inside the lock was the hang.</p></div>
-        <div class="step"><h4>Queue guard + single-flight lock + total timeout — <code>_run_scrape()</code></h4><p>Shed load past a queue depth (<code class="ic">busy</code>), then serialize scrapes through <code class="ic">Semaphore(1)</code> under a hard per-lookup ceiling so one stuck scrape can never wedge the service.</p></div>
+        <div class="step"><h4>Rate limit — <code>bc_rate_limiter.acquire(max_wait=…)</code></h4><p>Wait for the minimum spacing and window/hourly caps <strong>before</strong> taking the scrape slot (acquiring it inside the lock was the hang), and only while the projected wait stays under <code class="ic">SCRAPE_MAX_PROJECTED_WAIT_SECONDS</code>. Beyond that the caller gets <code class="ic">busy</code> with a <code class="ic">Retry-After</code> header instead of hanging.</p></div>
+        <div class="step"><h4>Queue guard + priority scrape slot + total timeout — <code>_run_scrape()</code></h4><p>Shed load past a queue depth (<code class="ic">busy</code>), then serialize scrapes through a single-slot <code class="ic">ScrapeGate</code>, where a waiting live request always goes before batch work, under a hard per-lookup ceiling so one stuck scrape can never wedge the service.</p></div>
         <div class="step"><h4>Fresh context → scrape steps — <code>lookup_context()</code> + <code>scrape_address()</code></h4><p>A brand-new browser context and page per lookup. Load home, type the address, wait for autocomplete, open the property, confirm it rendered, extract HTML.</p></div>
         <div class="step"><h4>Classify — <code>FailureType</code></h4><p>Every outcome is either a success or a <em>typed</em> failure: <code class="ic">not_found</code>, <code class="ic">blocked</code>, <code class="ic">timeout</code>, <code class="ic">parse_empty</code>, <code class="ic">error</code>, or <code class="ic">busy</code>.</p></div>
         <div class="step"><h4>Record &amp; alert — <code>_record_outcome()</code></h4><p>Valid results go to the cache; failures go to a retry queue with reason/step/URL/snapshot; blocks fire a de-duplicated Telegram alert; recovery sends one all-clear.</p></div>
@@ -540,16 +546,21 @@ failure = outcome.failure <span class="k">or</span> FailureType.ERROR
 
     <div class="fn">
       <div class="fn-sig">async def _run_scrape(address) -&gt; LookupOutcome</div>
-      <p>The concurrency-critical core. It applies a queue-depth guard, acquires the rate limiter <em>before</em> the lock, then runs one scrape at a time under a hard total timeout.</p>
+      <p>The concurrency-critical core. It applies a queue-depth guard, registers live demand so batch work yields, acquires the rate limiter <em>before</em> the slot with a bounded wait, then runs one scrape at a time under a hard total timeout. <code class="ic">_run_scrape(address, batch=True)</code> is the batch worker's path: it never sheds load and sleeps only outside the slot.</p>
       <pre class="code"><span class="k">async with</span> _queue_lock:
     <span class="k">if</span> max_depth &gt; 0 <span class="k">and</span> _queue_depth &gt;= max_depth:
         <span class="k">return</span> LookupOutcome.failed(FailureType.BUSY, ...)   <span class="c"># shed load fast</span>
     _queue_depth += 1
 
-<span class="c"># Outside the scrape lock on purpose — this is the Defect 4 fix.</span>
-<span class="k">await</span> bc_rate_limiter.acquire()
+<span class="k">async with</span> _scrape_gate.live_demand():             <span class="c"># batch yields slot + tokens to us</span>
+    <span class="c"># Outside the scrape slot on purpose — this is the Defect 4 fix.</span>
+    wait = <span class="k">await</span> bc_rate_limiter.acquire(max_wait=settings.scrape_max_projected_wait_seconds)
+    <span class="k">if</span> wait <span class="k">is not</span> None:
+        <span class="k">return</span> _busy(..., wait)                     <span class="c"># busy + Retry-After, never an hour-long hang</span>
+    <span class="k">async with</span> _scrape_gate.slot():                 <span class="c"># single-flight, live before batch</span>
+        <span class="k">return await</span> _scrape_with_ceiling(address)
 
-<span class="k">async with</span> _scrape_lock:                       <span class="c"># Semaphore(1): one scrape at a time</span>
+<span class="c"># _scrape_with_ceiling:</span>
     <span class="k">try</span>:
         <span class="k">return await</span> asyncio.wait_for(
             _scrape_once(address),
@@ -558,8 +569,8 @@ failure = outcome.failure <span class="k">or</span> FailureType.ERROR
         browser_manager.request_restart(<span class="s">"lookup exceeded total timeout"</span>)
         <span class="k">return</span> LookupOutcome.failed(FailureType.TIMEOUT, ..., step=<span class="s">"total_timeout"</span>)</pre>
       <div class="note fix"><span class="nt">The fix — Defect 4 (the hang)</span><p>Rate limiting now happens <em>before</em> <code class="ic">_scrape_lock</code>, so a request sleeping at the hourly cap no longer holds the semaphore that every other request needs. Two more guards back it up: the queue-depth check returns a fast <code class="ic">busy</code> instead of letting callers pile up unboundedly, and <code class="ic">asyncio.wait_for</code> caps any single scrape — on breach it flags the browser for relaunch, because a lookup that blew its whole budget means Chromium is in a bad state.</p></div>
-      <p class="label">Note on the remaining edge</p>
-      <p>A capped-out <em>hourly</em> wait is still not bounded — waiters serialize on the limiter's own lock, and that wait sits outside the timeout. Callers past the queue depth get a fast <code class="ic">busy</code>; the honest fix would be to return <code class="ic">busy</code> once the projected wait exceeds a threshold. This is documented as a known limitation rather than hidden.</p>
+      <p class="label">The edge that used to remain — now closed</p>
+      <p>The first fix left a capped-out <em>hourly</em> wait unbounded: waiters serialized on the limiter's own lock, outside the total timeout, so a request could block for up to an hour. The limiter now reports <code class="ic">projected_wait()</code> without sleeping and never holds a lock while waiting, and <code class="ic">/address</code> answers <code class="ic">busy</code> with <code class="ic">Retry-After</code> within about a second once the projected wait exceeds the threshold. The <code class="ic">busy</code> body and its HTTP 200 status are unchanged; the header is additive.</p>
     </div>
 
     <div class="fn">
@@ -758,42 +769,112 @@ typed        = <span class="k">await</span> page.locator(SEARCH_SELECTOR).first.
     <!-- ================= rate_limit.py ================= -->
     <div class="filehead" id="ratelimit">
       <div class="path"><span class="tag">Engine</span> app/services/rate_limit.py</div>
-      <p class="role">Three composable limiters that together keep the service a polite guest on bcassessment.ca: a minimum spacing between requests, a short-window cap, and an hourly cap. Cache hits are never rate-limited — only real BC visits.</p>
+      <p class="role">Composable limiters that together keep the service a polite guest on bcassessment.ca: a minimum spacing between requests, a short-window cap, an hourly cap, and a batch-only share of that hourly cap. Each can say how long the next call would wait <em>without sleeping</em>. Cache hits are never rate-limited — only real BC visits.</p>
     </div>
 
     <div class="fn">
       <div class="fn-sig">class BCRateLimiter — sliding-window cap</div>
-      <p>Allows at most <code class="ic">max_calls</code> BC operations per <code class="ic">window_seconds</code>, using a deque of timestamps. When full, it sleeps exactly until the oldest timestamp ages out.</p>
-      <pre class="code"><span class="k">while</span> self._timestamps <span class="k">and</span> now - self._timestamps[0] &gt;= self.window_seconds:
-    self._timestamps.popleft()               <span class="c"># drop timestamps outside the window</span>
-<span class="k">if</span> len(self._timestamps) &lt; self.max_calls:
-    self._timestamps.append(now);  <span class="k">return</span>   <span class="c"># room — record and proceed</span>
-wait = self.window_seconds - (now - self._timestamps[0])
-<span class="k">await</span> asyncio.sleep(max(wait, 0.05))          <span class="c"># else sleep until a slot frees</span></pre>
+      <p>Allows at most <code class="ic">max_calls</code> BC operations per <code class="ic">window_seconds</code>, using a deque of timestamps. <code class="ic">projected_wait()</code> reports how long until the oldest timestamp ages out; <code class="ic">record()</code> takes a slot. Asking never consumes anything.</p>
+      <pre class="code"><span class="k">def</span> projected_wait(self, now):
+    self._prune(now)                          <span class="c"># drop timestamps outside the window</span>
+    <span class="k">if</span> len(self._timestamps) &lt; self.max_calls:
+        <span class="k">return</span> 0.0                            <span class="c"># room now</span>
+    <span class="k">return</span> self.window_seconds - (now - self._timestamps[0])
+
+<span class="k">def</span> record(self, now):
+    self._timestamps.append(now)</pre>
       <p class="label">Why a sliding window</p>
       <p>A fixed bucket allows bursts at boundaries; a sliding window smooths traffic to a true rate, which is what avoids tripping BC's throttling.</p>
     </div>
 
     <div class="fn">
       <div class="fn-sig">class BCMinIntervalLimiter · class BCRateLimitGroup</div>
-      <p><code class="ic">BCMinIntervalLimiter</code> enforces a floor of <code class="ic">min_interval_seconds</code> between consecutive requests. <code class="ic">BCRateLimitGroup</code> chains all enabled limiters so every tier must clear before a scrape proceeds.</p>
+      <p><code class="ic">BCMinIntervalLimiter</code> enforces a floor of <code class="ic">min_interval_seconds</code> between consecutive requests. <code class="ic">BCRateLimitGroup</code> combines the tiers: <code class="ic">try_acquire()</code> takes a slot only if every tier is clear and otherwise returns the longest wait; <code class="ic">acquire(max_wait=…)</code> sleeps between attempts, holding nothing, and gives up with the projected wait once it would exceed <code class="ic">max_wait</code>.</p>
       <pre class="code">bc_rate_limiter = BCRateLimitGroup(
     BCMinIntervalLimiter(min_interval_seconds),   <span class="c"># ≥ 4s between visits</span>
     BCRateLimiter(short_max, 60),                 <span class="c"># burst cap</span>
     BCRateLimiter(hourly_max, 3600),              <span class="c"># hourly ceiling</span>
+    batch_limiters=(
+        BCRateLimiter(hourly_max * 0.7, 3600),    <span class="c"># batch share: 350 of 500</span>
+    ),
 )</pre>
-      <div class="note inv"><span class="nt">Invariant</span><p>This whole group is acquired <em>before</em> the scrape lock (see <code class="ic">_run_scrape</code>). That ordering is Defect 4's fix — a limiter sleeping at the hourly cap must never be holding the semaphore the rest of the service is waiting on.</p></div>
+      <div class="note inv"><span class="nt">Invariant</span><p>The check and the record in <code class="ic">try_acquire()</code> contain no <code class="ic">await</code>, so on the event loop they are atomic and need no lock — and so nothing ever sleeps while holding one. The group is still acquired <em>before</em> the scrape slot (see <code class="ic">_run_scrape</code>): a caller waiting for the hourly cap must never hold the slot the rest of the service is waiting on.</p></div>
+    </div>
+
+    <!-- ================= batch.py ================= -->
+    <div class="filehead" id="batch">
+      <div class="path"><span class="tag">Batch</span> app/services/batch.py</div>
+      <p class="role">Bulk lookups without a parallel code path. <code class="ic">POST /batch</code> takes up to 500 addresses, answers what it can from the cache at once, and a single background worker scrapes the rest — through the very same <code class="ic">lookup_by_address</code>, so the cache, fresh context per lookup, block detection, the never-cache-invalid rule and the <code class="ic">failed_lookups</code> record all still apply.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">submit(addresses, client_ref, callback_url) — cache-first</div>
+      <p>Normalizes each address with the existing cache key, de-duplicates, and resolves every unique address that is already in the positive or negative cache via <code class="ic">cached_outcome()</code> — the same function <code class="ic">/address</code> uses. Only the misses become pending items. A fully cached job is <code class="ic">completed</code> on return.</p>
+      <pre class="code"><span class="k">for</span> key, raw <span class="k">in</span> unique.items():
+    hit = <span class="k">await</span> cached_outcome(raw)          <span class="c"># no scraper, no rate-limit cost</span>
+    <span class="k">if</span> hit: resolved[key] = hit
+<span class="c"># 429 if too many active jobs / pending items, then one INSERT per job</span></pre>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">BatchWorker.step() — one address at a time, oldest job first</div>
+      <p>Claims <em>every</em> pending item for the next due address — across indexes and across jobs — so duplicates share one scrape, then calls <code class="ic">lookup_by_address(raw, batch=True)</code>, which re-checks the cache first. The outcome is written per item immediately, so a restart loses at most the scrape in flight.</p>
+      <pre class="code">claimed = claim_key(item.address_key)           <span class="c"># pending → in flight, all jobs</span>
+outcome = <span class="k">await</span> lookup_by_address(raw, batch=True)
+<span class="c"># done / not_found are final; timeout · error · blocked retry with</span>
+<span class="c"># 30s · 60s · … backoff up to BATCH_ITEM_MAX_ATTEMPTS, then failed</span>
+update_items(...)                              <span class="c"># one commit per resolved address</span></pre>
+      <div class="note fix"><span class="nt">Circuit breaker</span><p>After <code class="ic">BATCH_PAUSE_AFTER_BLOCKED</code> consecutive <code class="ic">blocked</code> results, every active job is paused with a reason and one Telegram alert is sent. The worker then probes a single item at growing intervals (30 s doubling to 15 min); a blocked probe costs the item no attempt. A successful probe — or any live <code class="ic">/address</code> success since the pause — resumes the jobs. Per-address <code class="ic">not_found</code>/<code class="ic">blocked</code> alerts are suppressed for batch items so an import cannot flood Telegram.</p></div>
+      <div class="note inv"><span class="nt">Invariant</span><p>Batch never makes the service faster or ruder towards BC than a client loop: it waits instead of shedding, keeps the 4 s spacing, and is capped at 70% of the hourly budget.</p></div>
+    </div>
+
+    <!-- ================= scrape_gate.py ================= -->
+    <div class="filehead" id="gate">
+      <div class="path"><span class="tag">Batch</span> app/services/scrape_gate.py</div>
+      <p class="role">The single scrape slot that replaced <code class="ic">Semaphore(1)</code>. Still single-flight; the only change is <em>who goes next</em>.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">ScrapeGate.live_demand() · ScrapeGate.slot(batch=False)</div>
+      <p>A live request registers demand as soon as it starts waiting — including while it waits for a rate-limit token. A batch caller takes neither the slot nor a token while any live demand exists. A scrape in progress is never interrupted, so a live request waits behind at most the one scrape already running.</p>
+      <pre class="code"><span class="k">await</span> cond.wait_for(<span class="k">lambda</span>: <span class="k">not</span> held <span class="k">and</span> (<span class="k">not</span> batch <span class="k">or</span> live_pending == 0))</pre>
+      <div class="note inv"><span class="nt">Invariant</span><p>The batch path sleeps only in its own loop, outside the gate: if a live request took the token while batch waited for the slot, batch releases the slot and goes back to sleep.</p></div>
+    </div>
+
+    <!-- ================= webhook.py ================= -->
+    <div class="filehead" id="webhook">
+      <div class="path"><span class="tag">Batch</span> app/services/webhook.py</div>
+      <p class="role">Tells the caller a job finished, with an HMAC-signed POST of <code class="ic">{job_id, state, total, progress}</code> — no property data. Built from the standard library plus the existing <code class="ic">httpx</code>.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">validate_callback_url() · deliver(job_id)</div>
+      <p>Signs the raw body as <code class="ic">X-BC-Signature: sha256=&lt;hmac&gt;</code> and retries non-2xx replies three times with backoff. Delivery reuses the Telegram module's background-task holder, so it is never garbage-collected mid-flight and is flushed on shutdown.</p>
+      <div class="note fix"><span class="nt">SSRF guards</span><p>https only; host must be on <code class="ic">BATCH_CALLBACK_ALLOWED_HOSTS</code>; no credentials in the URL; redirects never followed; 5 s timeout; hosts resolving to private, loopback or link-local addresses are refused. With no allowlist or no secret, webhooks are off and a submit asking for one gets 400.</p></div>
+    </div>
+
+    <!-- ================= routes/batch.py + db/batch.py ================= -->
+    <div class="filehead" id="batchroutes">
+      <div class="path"><span class="tag">Batch</span> app/routes/batch.py · app/db/batch.py</div>
+      <p class="role">The HTTP surface and the persistence behind it.</p>
+    </div>
+
+    <div class="fn">
+      <div class="fn-sig">POST /batch · GET /batch/{id} · DELETE /batch/{id} · GET /batch/{id}/results.csv</div>
+      <p>Every route sits behind <code class="ic">BATCH_ENABLED</code> (503) and a constant-time <code class="ic">X-API-Key</code> check (401, fail-closed). Invalid bodies are 400 on <code class="ic">/batch</code> only — <code class="ic">/address</code> keeps FastAPI's 422. Items carry the exact <code class="ic">/address</code> result object plus <code class="ic">source</code> and <code class="ic">error_type</code>; pages are 100 by default. Cancel keeps results already produced; the CSV export neutralizes spreadsheet formulas.</p>
+      <p class="label">Persistence and restarts</p>
+      <p><code class="ic">batch_jobs</code> and <code class="ic">batch_items</code> hold one row per original index. An item claimed by the worker is internally <code class="ic">running</code> (reported as <code class="ic">pending</code>); on startup <code class="ic">recover()</code> returns those to pending and resumes paused jobs. Finished jobs are purged after <code class="ic">BATCH_RETENTION_DAYS</code>; active jobs never are.</p>
     </div>
 
     <!-- ================= connection.py ================= -->
     <div class="filehead" id="connection">
       <div class="path"><span class="tag">Data</span> app/db/connection.py</div>
-      <p class="role">Owns the one shared SQLite connection <em>and</em> the schema DDL, so the runtime and the setup script can never drift. The schema is <code class="ic">CREATE TABLE IF NOT EXISTS</code> throughout and is re-applied on connect.</p>
+      <p class="role">Owns the SQLite connections (one per thread) <em>and</em> the schema DDL, so the runtime and the setup script can never drift. The schema is <code class="ic">CREATE TABLE IF NOT EXISTS</code> throughout and is re-applied on connect.</p>
     </div>
 
     <div class="fn">
       <div class="fn-sig">SCHEMA · init_db(path) · db_path()</div>
-      <p>Defines two tables — <code class="ic">assessment_cache</code> (successes) and <code class="ic">failed_lookups</code> (failures + negative cache) — and applies them idempotently. <code class="ic">setup_db.py</code> reuses this exact DDL.</p>
+      <p>Defines four tables — <code class="ic">assessment_cache</code> (successes), <code class="ic">failed_lookups</code> (failures + negative cache), and <code class="ic">batch_jobs</code> / <code class="ic">batch_items</code> (batch work) — and applies them idempotently, in WAL mode. <code class="ic">setup_db.py</code> reuses this exact DDL.</p>
       <pre class="code"><span class="k">def</span> init_db(path=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     conn.executescript(SCHEMA)     <span class="c"># CREATE TABLE IF NOT EXISTS … idempotent</span></pre>
@@ -802,14 +883,14 @@ wait = self.window_seconds - (now - self._timestamps[0])
     </div>
 
     <div class="fn">
-      <div class="fn-sig">get_connection() — single shared connection, WAL mode</div>
-      <p>Returns one process-wide connection (created lazily under a lock), tuned for a mixed read/write workload.</p>
+      <div class="fn-sig">get_connection() — one connection per thread, WAL mode</div>
+      <p>Returns this thread's long-lived connection (created lazily under a lock), tuned for a mixed read/write workload. DB calls run in <code class="ic">asyncio.to_thread</code> workers, so each worker thread keeps its own.</p>
       <pre class="code">conn = sqlite3.connect(path, check_same_thread=False, timeout=15.0)
 conn.execute(<span class="s">"PRAGMA journal_mode=WAL"</span>)      <span class="c"># a write never blocks a read</span>
 conn.execute(<span class="s">"PRAGMA synchronous=NORMAL"</span>)
 conn.execute(<span class="s">"PRAGMA busy_timeout=15000"</span>)</pre>
-      <p class="label">Why one connection + WAL</p>
-      <p>The old code opened and closed a connection on every cache read/write. One shared connection removes that churn; WAL lets the cache be read while a failure is being written, which matters because both happen on the same request path. <code class="ic">reset_for_tests()</code> drops the cached handle so a test can point at a throwaway DB.</p>
+      <p class="label">Why one connection per thread + WAL</p>
+      <p>The old code opened and closed a connection on every cache read/write; long-lived connections remove that churn. They must not be <em>shared</em> between threads, though: two threads querying one connection at once can interleave, and one receives the other's row. That surfaced as an <code class="ic">IndexError</code> in <code class="ic">cache_get</code> once batch submit and the batch worker read concurrently. Per-thread connections are the standard answer; WAL gives concurrent readers and <code class="ic">busy_timeout</code> serializes writers. <code class="ic">reset_for_tests()</code> closes them all so a test can point at a throwaway DB.</p>
     </div>
 
     <!-- ================= cache.py ================= -->
@@ -963,6 +1044,9 @@ task.add_done_callback(_background_tasks.discard) <span class="c"># without this
             <tr><td>Readiness matched previous property's value</td><td><span class="ft sf">corruption</span></td><td>Clean context means no stale "Total value" to match early</td><td><code>browser.py</code> + <code>scraper.py</code></td></tr>
             <tr><td>Browser/context never recycled → challenge page</td><td><span class="ft sf">degradation</span></td><td>Recycle after N lookups / N failures / disconnect</td><td><code>browser.py</code></td></tr>
             <tr><td>Rate-limit sleep held the scrape lock</td><td><span class="ft sf">hang</span></td><td>Acquire rate limiter <em>before</em> the lock; queue guard; total-timeout ceiling</td><td><code>lookup.py</code></td></tr>
+            <tr><td>Hourly-cap wait still unbounded (up to an hour)</td><td><span class="ft sf">hang</span></td><td><code>projected_wait()</code> without sleeping; <code>busy</code> + <code>Retry-After</code> above the threshold; no lock held while waiting</td><td><code>rate_limit.py</code> + <code>lookup.py</code></td></tr>
+            <tr><td>Bulk callers could starve live traffic</td><td><span class="ft nf">fairness</span></td><td><code>/batch</code> worker behind a priority gate and a 70% hourly share</td><td><code>scrape_gate.py</code> + <code>batch.py</code></td></tr>
+            <tr><td>One SQLite connection shared across threads</td><td><span class="ft sf">corruption</span></td><td>One connection per thread; WAL for concurrent readers</td><td><code>connection.py</code></td></tr>
             <tr><td>Every failure collapsed to <code>None</code></td><td><span class="ft sf">blindness</span></td><td><code>FailureType</code> taxonomy, named steps, block detection</td><td><code>schemas.py</code> + <code>scraper.py</code></td></tr>
             <tr><td>Invalid results cached as success</td><td><span class="ft sf">corruption</span></td><td><code>cache_set</code> refuses rows without <code>total_value</code></td><td><code>cache.py</code></td></tr>
             <tr><td>Unknown addresses re-scraped every time</td><td><span class="ft nf">waste</span></td><td>Negative cache for <code>not_found</code> only</td><td><code>failures.py</code></td></tr>
