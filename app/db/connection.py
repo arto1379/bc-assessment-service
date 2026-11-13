@@ -59,6 +59,45 @@ CREATE INDEX IF NOT EXISTS idx_failed_lookups_norm
     ON failed_lookups(normalized_address);
 CREATE INDEX IF NOT EXISTS idx_failed_lookups_retry
     ON failed_lookups(resolved_at, next_retry_at);
+
+-- Batch lookups (POST /batch). One row per job, one row per submitted address
+-- (duplicates included, so every original index has a row); items sharing an
+-- address_key are resolved by a single scrape.
+CREATE TABLE IF NOT EXISTS batch_jobs (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    total INTEGER NOT NULL,
+    client_ref TEXT,
+    callback_url TEXT,
+    paused_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_jobs_state ON batch_jobs(state, created_at);
+
+CREATE TABLE IF NOT EXISTS batch_items (
+    job_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    address_raw TEXT NOT NULL,
+    address_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    result_json TEXT,
+    error_type TEXT,
+    source TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (job_id, idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_items_due
+    ON batch_items(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_batch_items_job_idx
+    ON batch_items(job_id, idx);
+CREATE INDEX IF NOT EXISTS idx_batch_items_key
+    ON batch_items(address_key, state);
 """
 
 _lock = threading.Lock()
@@ -78,6 +117,9 @@ def init_db(path: Path | None = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(target)
     try:
+        # WAL is persistent in the file, so setting it here covers every later
+        # connection (batch writes one row per ~4 s alongside live reads).
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         conn.commit()
     finally:

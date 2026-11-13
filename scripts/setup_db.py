@@ -10,8 +10,9 @@ Optional custom path:
     python scripts/setup_db.py /path/to/bc_assessment.db
 
 Safe to re-run: the schema is CREATE TABLE IF NOT EXISTS throughout, so this
-also acts as the migration that adds `failed_lookups` to an existing database
-without touching cached results.
+also acts as the migration that adds `failed_lookups`, `batch_jobs` and
+`batch_items` to an existing database without touching cached results. It also
+switches the database to WAL mode.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ def main() -> None:
         queued = conn.execute(
             "SELECT COUNT(*) FROM failed_lookups WHERE resolved_at IS NULL"
         ).fetchone()[0]
+        batch_jobs = conn.execute("SELECT COUNT(*) FROM batch_jobs").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
     finally:
         conn.close()
 
@@ -52,6 +55,8 @@ def main() -> None:
     print(f"  tables: {', '.join(tables)}")
     print(f"  cached addresses: {cached}")
     print(f"  unresolved failures: {queued}")
+    print(f"  batch jobs: {batch_jobs}")
+    print(f"  journal mode: {journal}")
 
 
 if __name__ == "__main__":

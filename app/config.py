@@ -34,8 +34,20 @@ class Settings(BaseSettings):
     # this for a rate-limit slot. Bounds the old up-to-an-hour hourly-cap wait.
     scrape_max_projected_wait_seconds: float = 30.0
 
+    # Batch lookups (POST /batch) — off until explicitly enabled
+    batch_enabled: bool = False
+    batch_api_keys: str = ""  # comma-separated values accepted in X-API-Key
+    batch_max_addresses: int = 500
+    batch_max_active_jobs: int = 3
+    batch_max_pending_items: int = 2000
     # Fraction of BC_RATE_LIMIT_HOURLY_MAX that batch jobs may use (0.7 = 350/500)
     batch_hourly_share: float = 0.7
+    batch_item_max_attempts: int = 3
+    batch_pause_after_blocked: int = 3
+    batch_retention_days: int = 7
+    batch_webhook_secret: str = ""
+    # Hosts allowed in callback_url; empty disables webhooks
+    batch_callback_allowed_hosts: str = ""
 
     # Browser recycling — bounds Chromium memory growth and clears BC's cookies.
     # A fresh BrowserContext is created per lookup regardless of these.
@@ -72,6 +84,16 @@ class Settings(BaseSettings):
                 # A malformed chat id must not take the whole service down at import.
                 continue
         return ids
+
+    def get_batch_api_keys(self) -> list[str]:
+        return [k.strip() for k in self.batch_api_keys.split(",") if k.strip()]
+
+    def get_callback_allowed_hosts(self) -> set[str]:
+        return {
+            h.strip().lower()
+            for h in self.batch_callback_allowed_hosts.split(",")
+            if h.strip()
+        }
 
 
 settings = Settings()
