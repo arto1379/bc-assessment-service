@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class FailureType(str, Enum):
@@ -95,6 +95,15 @@ class AssessmentData(BaseModel):
 class SuccessResponse(BaseModel):
     status: str = "success"
     data: AssessmentData
+
+
+class BatchSubmitRequest(BaseModel):
+    """Body of POST /batch. Size and content rules are checked in the route so
+    they can return 400 with a precise message."""
+
+    addresses: list[str]
+    callback_url: Optional[str] = None
+    client_ref: Optional[str] = Field(default=None, max_length=200)
 
 
 class ErrorResponse(BaseModel):

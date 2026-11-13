@@ -51,8 +51,22 @@ class BatchLimitError(Exception):
     """Active-job or pending-item limit reached (HTTP 429)."""
 
 
-def _to_thread(func, *args, **kwargs):
-    return asyncio.to_thread(func, *args, **kwargs)
+# DB calls run in threads. Cancelling the awaiting task does not stop the
+# thread, so shutdown must wait for these before the shared SQLite connection
+# is closed — closing it under a running query crashes the process.
+_inflight_threads: set[asyncio.Future] = set()
+
+
+async def _to_thread(func, *args, **kwargs):
+    future = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    _inflight_threads.add(future)
+    future.add_done_callback(_inflight_threads.discard)
+    return await asyncio.shield(future)
+
+
+async def drain_threads() -> None:
+    if _inflight_threads:
+        await asyncio.gather(*list(_inflight_threads), return_exceptions=True)
 
 
 def _future_iso(seconds: float) -> str:
@@ -271,6 +285,7 @@ class BatchWorker:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
         self._wake: Optional[asyncio.Event] = None
+        self._stopping = False
         self._last_purge = 0.0
         self.reset()
 
@@ -307,17 +322,27 @@ class BatchWorker:
                 jobs,
             )
         self._wake = asyncio.Event()
+        self._stopping = False
+        self._last_purge = 0.0
         self._task = asyncio.create_task(self._run(), name="batch-worker")
         logger.info("batch worker started")
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float = 5.0) -> None:
+        """Let the current step finish (a restart loses at most the scrape in
+        flight either way), cancel after `timeout`, and drain DB threads."""
         if self._task is None:
             return
-        self._task.cancel()
+        self._stopping = True
+        self.wake()
         try:
-            await self._task
-        except (asyncio.CancelledError, Exception):
-            pass
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+        except (asyncio.TimeoutError, Exception):
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await drain_threads()
         self._task = None
         logger.info("batch worker stopped")
 
@@ -326,7 +351,7 @@ class BatchWorker:
             self._wake.set()
 
     async def _run(self) -> None:
-        while True:
+        while not self._stopping:
             try:
                 delay = await self.step()
             except asyncio.CancelledError:
@@ -334,7 +359,7 @@ class BatchWorker:
             except Exception:
                 logger.exception("batch worker step failed")
                 delay = 5.0
-            if delay > 0 and self._wake is not None:
+            if delay > 0 and self._wake is not None and not self._stopping:
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=delay)
                 except asyncio.TimeoutError:

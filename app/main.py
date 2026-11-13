@@ -1,10 +1,13 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.routes import batch as batch_routes
 from app.db import failures as failures_db
 from app.db.cache import cache_count
 from app.db.connection import close_connection, init_db
@@ -61,7 +64,25 @@ async def lifespan(_app: FastAPI):
         close_connection()
 
 
-app = FastAPI(title="BC Assessment Proxy", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="BC Assessment Proxy", version="0.3.0", lifespan=lifespan)
+app.include_router(batch_routes.router)
+
+
+@app.exception_handler(batch_routes.BatchHTTPError)
+async def _batch_error(_request: Request, exc: batch_routes.BatchHTTPError):
+    return exc.response()
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    """/batch reports an invalid body as 400 (PRD); every other route keeps
+    FastAPI's default 422, so /address is unchanged."""
+    if request.url.path == "/batch" or request.url.path.startswith("/batch/"):
+        first = exc.errors()[0] if exc.errors() else {}
+        where = ".".join(str(p) for p in first.get("loc", ()) if p != "body")
+        message = f"{where}: {first.get('msg', 'invalid request')}" if where else "invalid request"
+        return batch_routes.BatchHTTPError(400, message, "invalid_input").response()
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.get("/address")
