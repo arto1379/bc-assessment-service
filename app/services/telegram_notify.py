@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any, Coroutine
 
 import httpx
 
@@ -52,14 +53,21 @@ def send_telegram_message_background(text: str) -> None:
         return
 
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         logger.warning("No event loop for Telegram alert; not sent: %s", text)
         return
 
-    task = loop.create_task(send_telegram_message(text))
+    run_in_background(send_telegram_message(text))
+
+
+def run_in_background(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+    """Start a fire-and-forget task that cannot be garbage-collected mid-flight
+    and that `flush_pending()` waits for on shutdown. Also used for webhooks."""
+    task = asyncio.get_running_loop().create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 async def flush_pending(timeout: float = 5.0) -> None:

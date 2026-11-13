@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 from app.config import settings
 from app.db import batch as store
+from app.services import webhook
 from app.schemas import AssessmentResult, FailureType, LookupOutcome
 from app.services.browser import browser_manager
 from app.services.lookup import cached_outcome, lookup_by_address, normalize_address
@@ -272,8 +273,10 @@ async def iter_all_items(job_id: str, page: int = 500):
 
 
 async def on_job_terminal(job_id: str) -> None:
-    """Hook for a job reaching completed or cancelled (webhook delivery)."""
-    logger.info("batch job terminal job_id=%s", job_id)
+    """A job reached completed or cancelled: send its webhook, if it has one."""
+    job = await _to_thread(store.get_job, job_id)
+    if job is not None and job["callback_url"]:
+        webhook.deliver_background(job_id)
 
 
 # ---------------------------------------------------------------------------

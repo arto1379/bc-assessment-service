@@ -11,7 +11,6 @@ import hmac
 import io
 import json
 from typing import Optional
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, Query
 from fastapi.responses import JSONResponse, Response
@@ -19,6 +18,7 @@ from fastapi.responses import JSONResponse, Response
 from app.config import settings
 from app.schemas import BatchSubmitRequest, ErrorResponse
 from app.services import batch as batch_service
+from app.services import webhook
 
 MAX_ADDRESS_LENGTH = 200
 MAX_PAGE_SIZE = 500
@@ -74,14 +74,10 @@ def _validate(body: BatchSubmitRequest) -> list[str]:
                 f"addresses[{idx}] is longer than {MAX_ADDRESS_LENGTH} characters"
             )
     if body.callback_url is not None:
-        _validate_callback_url(body.callback_url)
+        problem = webhook.validate_callback_url(body.callback_url)
+        if problem:
+            raise _invalid(problem)
     return addresses
-
-
-def _validate_callback_url(url: str) -> None:
-    parts = urlsplit(url)
-    if parts.scheme != "https" or not parts.hostname:
-        raise _invalid("callback_url must be an https URL")
 
 
 def _status_body(data: dict) -> dict:
