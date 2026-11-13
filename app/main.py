@@ -1,7 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from fastapi.responses import JSONResponse
 
 from app.config import settings
@@ -61,6 +61,7 @@ app = FastAPI(title="BC Assessment Proxy", version="0.2.0", lifespan=lifespan)
 
 @app.get("/address")
 async def get_address(
+    response: Response,
     address: str = Query(..., min_length=1, description="Formatted address string"),
 ):
     address = address.strip()
@@ -77,6 +78,9 @@ async def get_address(
         return SuccessResponse(data=AssessmentData(result=outcome.result, status=200))
 
     failure = outcome.failure or FailureType.ERROR
+    if failure is FailureType.BUSY and outcome.retry_after:
+        # Additive: the HTTP status and body of `busy` are unchanged.
+        response.headers["Retry-After"] = str(outcome.retry_after)
     return ErrorResponse(
         status="error",
         message=_FAILURE_MESSAGES.get(failure, "Lookup failed"),

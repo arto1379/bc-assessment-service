@@ -24,8 +24,27 @@ from app.services.rate_limit import BCRateLimiter
 class NullLimiter:
     """Stands in for `bc_rate_limiter` so these tests never really sleep."""
 
-    async def acquire(self) -> None:
+    async def acquire(self, **_kwargs) -> None:
         return None
+
+    def projected_wait(self, **_kwargs) -> float:
+        return 0.0
+
+    def try_acquire(self, **_kwargs) -> float:
+        return 0.0
+
+
+class FakeClock:
+    """Deterministic monotonic clock for rate-limiter tests."""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 @pytest.fixture(autouse=True)
@@ -177,30 +196,168 @@ class TestRateLimiter:
 
         assert time.monotonic() - started >= 0.35, "third call ignored the window cap"
 
-    async def test_a_capped_out_wait_still_serialises_callers(self):
-        """Documents real behaviour that the module docstring understates.
-
-        Moving `bc_rate_limiter.acquire()` outside `_scrape_lock` did not make
-        waiters independent: `BCRateLimiter.acquire()` sleeps *inside* its own
-        `asyncio.Lock`, so callers still queue up — on the limiter's lock rather
-        than the scrape lock. What actually prevents a wedge is the queue guard
-        and the total-timeout ceiling above, not this reordering.
-
-        Note also that `acquire()` sits outside `asyncio.wait_for` in
-        `_run_scrape`, so `SCRAPE_TOTAL_TIMEOUT_MS` does not bound this wait.
-        """
-        limiter = BCRateLimiter(max_calls=1, window_seconds=0.4, label="test")
+    async def test_waiters_do_not_hold_a_lock_while_sleeping(self):
+        """The old limiter slept inside its own asyncio.Lock, so one capped-out
+        waiter blocked everyone behind it, outside SCRAPE_TOTAL_TIMEOUT_MS. Now a
+        sleeping waiter blocks nobody: `projected_wait` answers instantly while
+        another caller is asleep."""
+        limiter = BCRateLimiter(max_calls=1, window_seconds=0.5, label="test")
         await limiter.acquire()  # consume the only slot
 
+        sleeper = asyncio.create_task(limiter.acquire())
+        await asyncio.sleep(0.05)  # sleeper is now asleep waiting for the window
+
         started = time.monotonic()
+        wait = limiter.projected_wait(time.monotonic())
+        assert time.monotonic() - started < 0.01
+        assert 0 < wait <= 0.5
+        assert not sleeper.done()
+        await sleeper
 
-        async def waiter() -> float:
-            await limiter.acquire()
-            return time.monotonic() - started
 
-        first, second = await asyncio.gather(waiter(), waiter())
+def _group(clock, *, spacing=4.0, short=(15, 60.0), hourly=(500, 3600.0), share=0.7):
+    from app.services.rate_limit import BCMinIntervalLimiter, BCRateLimitGroup
 
-        assert second - first >= 0.25, (
-            "waiters proceeded together; if that is now true, the limiter no "
-            "longer sleeps under its own lock and this test should be revisited"
-        )
+    return BCRateLimitGroup(
+        BCMinIntervalLimiter(spacing, clock=clock),
+        BCRateLimiter(*short, label="short", clock=clock),
+        BCRateLimiter(*hourly, label="hourly", clock=clock),
+        batch_limiters=(
+            BCRateLimiter(int(hourly[0] * share), hourly[1], label="batch", clock=clock),
+        ),
+        clock=clock,
+    )
+
+
+class TestProjectedWait:
+    def test_projected_wait_reports_without_sleeping_or_recording(self):
+        clock = FakeClock()
+        group = _group(clock)
+
+        assert group.projected_wait() == 0
+        assert group.try_acquire() == 0
+        # Spacing now applies; asking twice must not consume anything.
+        assert group.projected_wait() == pytest.approx(4.0)
+        assert group.projected_wait() == pytest.approx(4.0)
+        clock.advance(4.0)
+        assert group.projected_wait() == 0
+
+    def test_at_the_hourly_cap_the_wait_is_reported_not_slept(self):
+        clock = FakeClock()
+        group = _group(clock, spacing=0, short=(0, 0), hourly=(3, 3600.0))
+        for _ in range(3):
+            assert group.try_acquire() == 0
+
+        assert group.try_acquire() == pytest.approx(3600.0)
+
+    async def test_acquire_with_max_wait_returns_promptly_instead_of_hanging(self):
+        """Acceptance: at the hourly cap, /address answers busy within 1 s."""
+        from app.services.rate_limit import BCRateLimitGroup
+
+        group = BCRateLimitGroup(BCRateLimiter(1, 3600.0, label="hourly"))
+        assert await group.acquire(max_wait=30) is None  # takes the only slot
+
+        started = time.monotonic()
+        wait = await group.acquire(max_wait=30)
+        assert time.monotonic() - started < 1
+        assert wait is not None and wait > 30
+
+    async def test_acquire_waits_when_the_projected_wait_is_within_budget(self):
+        from app.services.rate_limit import BCMinIntervalLimiter, BCRateLimitGroup
+
+        group = BCRateLimitGroup(BCMinIntervalLimiter(0.2))
+        assert await group.acquire(max_wait=1) is None
+        started = time.monotonic()
+        assert await group.acquire(max_wait=1) is None
+        assert time.monotonic() - started >= 0.15
+
+    def test_batch_never_exceeds_its_hourly_share(self):
+        """An hour of back-to-back batch demand on a fake clock."""
+        clock = FakeClock()
+        group = _group(clock)
+        granted = 0
+        hour_end = clock.now + 3600
+        while clock.now < hour_end:
+            wait = group.try_acquire(batch=True)
+            if wait == 0:
+                granted += 1
+            else:
+                clock.advance(wait)
+
+        assert granted == 350
+
+    def test_live_traffic_keeps_the_rest_of_the_hourly_cap(self):
+        clock = FakeClock()
+        group = _group(clock, spacing=0, short=(0, 0))
+        for _ in range(350):
+            assert group.try_acquire(batch=True) == 0
+
+        assert group.try_acquire(batch=True) > 0, "batch share exhausted"
+        live = sum(1 for _ in range(200) if group.try_acquire() == 0)
+        assert live == 150, "live requests get the remaining 30% and no more"
+
+
+class TestBusyRetryAfter:
+    async def test_run_scrape_returns_busy_with_retry_after_over_threshold(
+        self, monkeypatch
+    ):
+        from app.services.rate_limit import BCRateLimitGroup
+
+        monkeypatch.setattr(settings, "scrape_max_projected_wait_seconds", 30)
+        limiter = BCRateLimitGroup(BCRateLimiter(1, 3600.0, label="hourly"))
+        limiter.try_acquire()
+        monkeypatch.setattr(lookup_mod, "bc_rate_limiter", limiter)
+
+        async def never_called(address):
+            raise AssertionError("must not scrape when the wait is too long")
+
+        monkeypatch.setattr(lookup_mod, "_scrape_once", never_called)
+
+        started = time.monotonic()
+        outcome = await lookup_mod._run_scrape("CAPPED")
+
+        assert time.monotonic() - started < 1
+        assert outcome.failure is FailureType.BUSY
+        assert outcome.retry_after is not None and outcome.retry_after > 30
+        assert lookup_mod._queue_depth == 0
+
+    async def test_queue_depth_busy_also_carries_retry_after(self, monkeypatch):
+        monkeypatch.setattr(settings, "scrape_max_queue_depth", 1)
+        release = asyncio.Event()
+
+        async def slow_scrape(address):
+            await release.wait()
+            return _ok()
+
+        monkeypatch.setattr(lookup_mod, "_scrape_once", slow_scrape)
+        holder = asyncio.create_task(lookup_mod._run_scrape("HOLDER"))
+        await asyncio.sleep(0.05)
+        shed = await lookup_mod._run_scrape("SHED")
+        release.set()
+        await holder
+
+        assert shed.failure is FailureType.BUSY
+        assert shed.retry_after and shed.retry_after >= 1
+
+    def test_address_endpoint_sets_retry_after_and_keeps_the_busy_body(
+        self, client, monkeypatch
+    ):
+        import app.main as main_mod
+
+        async def busy(address):
+            return LookupOutcome.failed(FailureType.BUSY, "capped", retry_after=42)
+
+        monkeypatch.setattr(main_mod, "lookup_by_address", busy)
+        response = client.get("/address", params={"address": "1 ANY ST"})
+
+        assert response.status_code == 200  # unchanged: busy is not an HTTP error
+        assert response.headers["Retry-After"] == "42"
+        assert response.json() == {
+            "status": "error",
+            "message": "Service busy, please retry shortly",
+            "error_type": "busy",
+        }
+
+    def test_success_response_has_no_retry_after(self, client):
+        response = client.get("/address", params={"address": "7009 TISDALL ST VANCOUVER"})
+        assert "Retry-After" not in response.headers

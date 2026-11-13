@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     scrape_total_timeout_ms: int = 60_000
     # Requests allowed to queue for the scrape lock before we fast-fail the caller
     scrape_max_queue_depth: int = 20
+    # /address answers `busy` (with Retry-After) instead of waiting longer than
+    # this for a rate-limit slot. Bounds the old up-to-an-hour hourly-cap wait.
+    scrape_max_projected_wait_seconds: float = 30.0
+
+    # Fraction of BC_RATE_LIMIT_HOURLY_MAX that batch jobs may use (0.7 = 350/500)
+    batch_hourly_share: float = 0.7
 
     # Browser recycling — bounds Chromium memory growth and clears BC's cookies.
     # A fresh BrowserContext is created per lookup regardless of these.

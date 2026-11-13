@@ -40,6 +40,10 @@ class LookupOutcome:
     step: Optional[str] = None
     restarted: bool = False
     snapshot_path: Optional[str] = None
+    # Seconds the caller should wait before retrying (BUSY only)
+    retry_after: Optional[int] = None
+    # "cache" when served from the positive/negative cache, "scrape" otherwise
+    source: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -59,6 +63,7 @@ class LookupOutcome:
         step: str | None = None,
         restarted: bool = False,
         snapshot_path: str | None = None,
+        retry_after: int | None = None,
     ) -> "LookupOutcome":
         return cls(
             failure=failure,
@@ -67,6 +72,7 @@ class LookupOutcome:
             step=step,
             restarted=restarted,
             snapshot_path=snapshot_path,
+            retry_after=retry_after,
         )
 
 

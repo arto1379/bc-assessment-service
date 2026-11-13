@@ -4,6 +4,10 @@ Ordering note (this was the hang): the rate limiter is acquired *before* the
 scrape lock. Previously `bc_rate_limiter.acquire()` ran inside the lock, so
 hitting the hourly cap made one request sleep for up to an hour while holding
 the semaphore, blocking every other request behind it.
+
+The rate-limit wait itself is now bounded too: a live request whose projected
+wait exceeds `SCRAPE_MAX_PROJECTED_WAIT_SECONDS` gets `busy` with a
+`retry_after` hint instead of sleeping.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import re
 from typing import Optional
 
@@ -86,6 +91,34 @@ async def _scrape_once(address: str) -> LookupOutcome:
         return await scrape_address(page, address, restarted=restarted)
 
 
+async def _scrape_with_ceiling(address: str) -> LookupOutcome:
+    """One scrape under the hard total timeout. Caller holds the scrape slot."""
+    try:
+        return await asyncio.wait_for(
+            _scrape_once(address),
+            timeout=settings.scrape_total_timeout_ms / 1000,
+        )
+    except asyncio.TimeoutError:
+        # A lookup that blows the overall budget means the browser is
+        # in a bad state; force a relaunch before the next request.
+        browser_manager.request_restart("lookup exceeded total timeout")
+        return LookupOutcome.failed(
+            FailureType.TIMEOUT,
+            f"lookup exceeded {settings.scrape_total_timeout_ms}ms overall budget",
+            step="total_timeout",
+        )
+    except Exception as exc:
+        logger.exception("Unexpected scrape failure for %r", address)
+        browser_manager.request_restart(f"unexpected error: {type(exc).__name__}")
+        return LookupOutcome.failed(FailureType.ERROR, f"{type(exc).__name__}: {exc}")
+
+
+def _busy(reason: str, wait_seconds: float) -> LookupOutcome:
+    return LookupOutcome.failed(
+        FailureType.BUSY, reason, retry_after=max(1, math.ceil(wait_seconds))
+    )
+
+
 async def _run_scrape(address: str) -> LookupOutcome:
     """Rate-limit, then scrape under a hard timeout and a single-flight lock."""
     global _queue_depth
@@ -98,37 +131,32 @@ async def _run_scrape(address: str) -> LookupOutcome:
                 address,
                 _queue_depth,
             )
-            return LookupOutcome.failed(
-                FailureType.BUSY,
+            return _busy(
                 f"{_queue_depth} lookups already queued; try again shortly",
+                max(
+                    bc_rate_limiter.projected_wait(),
+                    settings.bc_rate_limit_min_interval_seconds,
+                ),
             )
         _queue_depth += 1
 
     try:
-        # Outside the scrape lock on purpose — see the module docstring.
-        await bc_rate_limiter.acquire()
+        # Outside the scrape lock on purpose — see the module docstring. With a
+        # max_wait the limiter returns the projected wait instead of sleeping
+        # past it, so this request never hangs at the hourly cap.
+        max_wait = settings.scrape_max_projected_wait_seconds
+        wait = await bc_rate_limiter.acquire(max_wait=max_wait)
+        if wait is not None:
+            logger.warning(
+                "Rejecting lookup for %r: projected rate-limit wait %.0fs > %.0fs",
+                address,
+                wait,
+                max_wait,
+            )
+            return _busy(f"rate limit reached; projected wait {wait:.0f}s", wait)
 
         async with _scrape_lock:
-            try:
-                return await asyncio.wait_for(
-                    _scrape_once(address),
-                    timeout=settings.scrape_total_timeout_ms / 1000,
-                )
-            except asyncio.TimeoutError:
-                # A lookup that blows the overall budget means the browser is
-                # in a bad state; force a relaunch before the next request.
-                browser_manager.request_restart("lookup exceeded total timeout")
-                return LookupOutcome.failed(
-                    FailureType.TIMEOUT,
-                    f"lookup exceeded {settings.scrape_total_timeout_ms}ms overall budget",
-                    step="total_timeout",
-                )
-            except Exception as exc:
-                logger.exception("Unexpected scrape failure for %r", address)
-                browser_manager.request_restart(f"unexpected error: {type(exc).__name__}")
-                return LookupOutcome.failed(
-                    FailureType.ERROR, f"{type(exc).__name__}: {exc}"
-                )
+            return await _scrape_with_ceiling(address)
     finally:
         async with _queue_lock:
             _queue_depth -= 1
