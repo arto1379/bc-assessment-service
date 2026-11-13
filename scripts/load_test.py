@@ -304,6 +304,9 @@ async def mode_soak(
     return report
 
 
+BATCH_DEFAULT_MAX = 500  # the service's default BATCH_MAX_ADDRESSES
+
+
 def synthetic_addresses(count: int, tag: str) -> list[str]:
     return [f"{n} {tag} LOADTEST ST VANCOUVER" for n in range(1, count + 1)]
 
@@ -371,7 +374,13 @@ async def mode_batch(
 ) -> Report:
     """Batch end to end, plus the stale-result check run through a batch."""
     report = Report(f"batch ({len(addresses)} addresses)")
-    job = await run_batch(client, addresses + UNKNOWN_ADDRESSES[:1], api_key, report, max_wait)
+    # Include one unknown address, without going over the default
+    # BATCH_MAX_ADDRESSES (500) when the list is already full.
+    submitted = list(addresses)
+    if len(submitted) >= BATCH_DEFAULT_MAX:
+        submitted = submitted[: BATCH_DEFAULT_MAX - 1]
+    submitted.append(UNKNOWN_ADDRESSES[0])
+    job = await run_batch(client, submitted, api_key, report, max_wait)
     if job is None:
         return report
 
@@ -401,7 +410,7 @@ async def mode_batch(
     # Re-submitting must be answered entirely from cache at submit time.
     started = time.monotonic()
     again = await client.post(
-        "/batch", json={"addresses": addresses}, headers={"X-API-Key": api_key}
+        "/batch", json={"addresses": submitted}, headers={"X-API-Key": api_key}
     )
     data = again.json().get("data", {})
     report.add_note(
