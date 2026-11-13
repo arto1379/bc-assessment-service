@@ -1,10 +1,17 @@
-"""Shared SQLite connection and schema.
+"""SQLite connections and schema.
 
-The previous code opened and closed a new connection on every cache read and
-write. This keeps one connection for the process (SQLite handles this fine with
-`check_same_thread=False` plus a lock) and enables WAL so a write never blocks a
-read. The schema lives here so the runtime and `scripts/setup_db.py` can never
-drift apart.
+The original code opened and closed a new connection on every cache read and
+write. This keeps one long-lived connection **per thread** (DB calls run in
+`asyncio.to_thread` workers) and enables WAL so a write never blocks a read.
+
+One connection shared by every thread is not safe: two threads querying it at
+the same time can interleave, and one gets the other's row back (seen as an
+IndexError in cache_get once batch submit and the worker read concurrently).
+Per-thread connections are the standard sqlite3 answer; WAL gives concurrent
+readers and `busy_timeout` serialises writers.
+
+The schema lives here so the runtime and `scripts/setup_db.py` can never drift
+apart.
 """
 
 from __future__ import annotations
@@ -101,7 +108,12 @@ CREATE INDEX IF NOT EXISTS idx_batch_items_key
 """
 
 _lock = threading.Lock()
-_conn: Optional[sqlite3.Connection] = None
+_local = threading.local()
+# Every connection opened, so close_connection() can close them all. Bumping
+# the generation makes each thread open a fresh one on its next call.
+_open: list[sqlite3.Connection] = []
+_generation = 0
+_schema_generation = -1
 
 
 def db_path() -> Path:
@@ -128,39 +140,48 @@ def init_db(path: Path | None = None) -> Path:
 
 
 def get_connection() -> sqlite3.Connection:
-    """Return the shared connection, creating the database if it is missing."""
-    global _conn
-    with _lock:
-        if _conn is not None:
-            return _conn
+    """Return this thread's connection, creating the database if it is missing."""
+    global _schema_generation
+    conn: Optional[sqlite3.Connection] = getattr(_local, "conn", None)
+    if conn is not None and getattr(_local, "generation", None) == _generation:
+        return conn
 
+    with _lock:
         path = db_path()
         if not path.exists():
             logger.info("Cache database missing; creating %s", path)
             init_db(path)
 
+        # check_same_thread=False only so close_connection() may close it from
+        # another thread; queries on it come from this thread alone.
         conn = sqlite3.connect(path, check_same_thread=False, timeout=15.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=15000")
-        # Applying the schema here keeps older databases (created before
-        # failed_lookups existed) working without a manual migration step.
-        conn.executescript(SCHEMA)
-        conn.commit()
-        _conn = conn
-        return _conn
+        if _schema_generation != _generation:
+            # Applying the schema here keeps older databases (created before
+            # failed_lookups / batch tables existed) working without a manual
+            # migration step. Once per generation is enough.
+            conn.executescript(SCHEMA)
+            conn.commit()
+            _schema_generation = _generation
+        _open.append(conn)
+        _local.conn = conn
+        _local.generation = _generation
+        return conn
 
 
 def close_connection() -> None:
-    global _conn
+    global _generation
     with _lock:
-        if _conn is not None:
+        for conn in _open:
             try:
-                _conn.close()
+                conn.close()
             except sqlite3.Error:
                 pass
-            _conn = None
+        _open.clear()
+        _generation += 1
 
 
 def reset_for_tests() -> None:

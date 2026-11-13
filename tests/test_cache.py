@@ -81,3 +81,40 @@ def test_ttl_zero_means_never_expire(monkeypatch):
         )
 
     assert cache_get("ANCIENT ST") is not None
+
+
+def test_concurrent_reads_from_many_threads_never_cross_rows():
+    """Regression: one connection shared by every thread let two concurrent
+    queries interleave, so cache_get received another query's row and raised
+    IndexError (seen when batch submit and the worker read at the same time).
+    DB calls run in asyncio.to_thread workers, so this is the real pattern."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.db import failures
+
+    keys = [f"{n} THREAD ST" for n in range(40)]
+    for n, key in enumerate(keys):
+        cache_set(key, AssessmentResult(total_value=f"${n}"))
+
+    def read(n: int) -> bool:
+        for _ in range(25):
+            got = cache_get(keys[n % len(keys)])
+            if got is None or got.total_value != f"${n % len(keys)}":
+                return False
+            failures.get_negative_cache(keys[n % len(keys)])  # a different query shape
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(pool.map(read, range(200)))
+
+
+def test_each_thread_gets_its_own_connection():
+    import threading
+
+    seen = []
+    thread = threading.Thread(target=lambda: seen.append(get_connection()))
+    thread.start()
+    thread.join()
+
+    assert seen[0] is not get_connection()
+    assert get_connection() is get_connection()
