@@ -114,9 +114,15 @@ async def submit(
             resolved[key] = hit
 
     to_scrape = sum(1 for _i, _r, key in rows if key not in resolved)
+    keys_to_scrape = len(unique) - len(resolved)
 
     async with _get_submit_lock():
+        estimated = 0
         if to_scrape:
+            # Estimated before this job exists, so a fast worker cannot race
+            # the count down to zero before we answer.
+            ahead = await _to_thread(store.pending_key_count)
+            estimated = _estimate_seconds(ahead + keys_to_scrape)
             active = await _to_thread(store.active_job_count)
             if active >= settings.batch_max_active_jobs:
                 raise BatchLimitError(
@@ -181,15 +187,14 @@ async def submit(
         "total": len(rows),
         "unique": len(unique),
         "cached": len(resolved),
-        "pending_scrape": len(unique) - len(resolved),
-        "estimated_seconds": await _estimate_seconds() if to_scrape else 0,
+        "pending_scrape": keys_to_scrape,
+        "estimated_seconds": estimated,
     }
 
 
-async def _estimate_seconds() -> int:
-    """Lower bound from the scrapes ahead (all active jobs) and the batch rate
-    share, plus any wait the limiter is already projecting."""
-    keys = await _to_thread(store.pending_key_count)
+def _estimate_seconds(keys: int) -> int:
+    """Lower bound from the scrapes ahead (all active jobs plus this one) and
+    the batch rate share, plus any wait the limiter is already projecting."""
     seconds = keys * seconds_per_batch_scrape() + bc_rate_limiter.projected_wait(batch=True)
     return int(math.ceil(seconds))
 
@@ -362,6 +367,14 @@ class BatchWorker:
             except Exception:
                 logger.exception("batch worker step failed")
                 delay = 5.0
+                # The single worker is between steps, so anything still in
+                # flight was orphaned by this failure; make it pending again.
+                try:
+                    released = await _to_thread(store.release_in_flight)
+                    if released:
+                        logger.warning("batch released %d orphaned in-flight items", released)
+                except Exception:
+                    logger.exception("batch could not release in-flight items")
             if delay > 0 and self._wake is not None and not self._stopping:
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=delay)
@@ -405,7 +418,15 @@ class BatchWorker:
         if not claimed:
             return None
 
-        outcome = await lookup_by_address(item["address_raw"], batch=True)
+        try:
+            outcome = await lookup_by_address(item["address_raw"], batch=True)
+        except Exception as exc:
+            # Never leave claimed items in flight: count it as an `error`
+            # attempt so the item retries with backoff like any other error.
+            logger.exception(
+                "batch lookup raised job_id=%s idx=%s", item["job_id"], item["idx"]
+            )
+            outcome = LookupOutcome.failed(FailureType.ERROR, f"{type(exc).__name__}: {exc}")
         self.items_processed += 1
         if outcome.source == "scrape":
             self.scrapes += 1
@@ -480,23 +501,29 @@ class BatchWorker:
     # ---- circuit breaker --------------------------------------------------
 
     async def _update_breaker(self, failure: Optional[FailureType], probe: bool) -> None:
+        # A page that answered (a result, or a genuine not-found) proves BC is
+        # serving us again; timeouts and errors prove nothing either way.
+        healthy = failure is None or failure is FailureType.NOT_FOUND
         if failure is FailureType.BLOCKED:
             self.blocked_streak += 1
-            if probe:
+        else:
+            self.blocked_streak = 0
+
+        if probe and self.paused:
+            if healthy:
+                await self._resume("probe lookup succeeded")
+            else:
                 self.probe_delay = min(self.probe_delay * 2, PROBE_MAX_SECONDS)
                 self.next_probe_at = time.monotonic() + self.probe_delay
                 logger.warning(
-                    "batch probe still blocked; next probe in %.0fs", self.probe_delay
-                )
-            elif self.blocked_streak >= max(settings.batch_pause_after_blocked, 1):
-                await self._pause(
-                    f"blocked: {self.blocked_streak} consecutive blocked results"
+                    "batch probe failed (%s); next probe in %.0fs",
+                    failure.value if failure else "unknown",
+                    self.probe_delay,
                 )
             return
 
-        self.blocked_streak = 0
-        if probe and self.paused:
-            await self._resume("probe lookup succeeded")
+        if self.blocked_streak >= max(settings.batch_pause_after_blocked, 1):
+            await self._pause(f"blocked: {self.blocked_streak} consecutive blocked results")
 
     async def _pause(self, reason: str) -> None:
         self.paused_since = store.now_iso()

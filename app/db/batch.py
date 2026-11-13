@@ -42,8 +42,8 @@ PENDING, IN_FLIGHT, DONE, NOT_FOUND, FAILED = (
 )
 OPEN_ITEM_STATES = (PENDING, IN_FLIGHT)
 
-# Batch writes are multi-statement transactions on the shared connection, which
-# other threads also use; serialise them so one never commits another's half.
+# Batch writes are multi-statement read-then-write transactions; serialising
+# them in-process avoids SQLITE_BUSY retries between submit, cancel and worker.
 _write_lock = threading.Lock()
 
 
@@ -386,23 +386,33 @@ def update_items(updates: list[dict[str, Any]]) -> None:
         )
 
 
+def release_in_flight() -> int:
+    """Return every in-flight item to pending (no attempt is counted).
+
+    Safe whenever the single worker is not mid-scrape: at startup, and after a
+    worker step failed unexpectedly between claiming and recording.
+    """
+    conn = get_connection()
+    with _write_lock, conn:
+        return conn.execute(
+            "UPDATE batch_items SET state = ?, updated_at = ? WHERE state = ?",
+            (PENDING, now_iso(), IN_FLIGHT),
+        ).rowcount
+
+
 def recover() -> tuple[int, int]:
     """Startup: in-flight items back to pending, paused jobs resume.
 
     Returns (items reset, jobs resumed). Queued and running jobs need nothing:
     the worker picks them up as it finds them.
     """
-    now = now_iso()
+    items = release_in_flight()
     conn = get_connection()
     with _write_lock, conn:
-        items = conn.execute(
-            "UPDATE batch_items SET state = ?, updated_at = ? WHERE state = ?",
-            (PENDING, now, IN_FLIGHT),
-        ).rowcount
         jobs = conn.execute(
             "UPDATE batch_jobs SET state = ?, paused_reason = NULL, updated_at = ? "
             "WHERE state = ?",
-            (RUNNING, now, PAUSED),
+            (RUNNING, now_iso(), PAUSED),
         ).rowcount
     return items, jobs
 

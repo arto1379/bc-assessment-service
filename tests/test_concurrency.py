@@ -210,7 +210,9 @@ class TestRateLimiter:
 
         started = time.monotonic()
         wait = limiter.projected_wait(time.monotonic())
-        assert time.monotonic() - started < 0.01
+        # Generous bound (GC pauses on a loaded CI box), still far below the
+        # ~0.45 s the sleeper has left.
+        assert time.monotonic() - started < 0.1
         assert 0 < wait <= 0.5
         assert not sleeper.done()
         await sleeper

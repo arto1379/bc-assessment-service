@@ -7,11 +7,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.routes import batch as batch_routes
 from app.db import batch as batch_db
 from app.db import failures as failures_db
 from app.db.cache import cache_count
 from app.db.connection import close_connection, init_db
+from app.routes import batch as batch_routes
 from app.schemas import (
     AssessmentData,
     ErrorResponse,

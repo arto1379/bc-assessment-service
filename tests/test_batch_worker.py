@@ -166,6 +166,36 @@ class TestRetries:
         assert scraper.calls["3 GONE ST"] == 1
         assert alerts == [], "not_found is not alerted per batch item"
 
+    async def test_a_lookup_that_raises_never_leaves_items_in_flight(
+        self, scraper, worker, alerts, monkeypatch
+    ):
+        """Regression: an exception between claim and record left the item
+        `running` (reported as pending) until the next restart."""
+
+        async def explodes(address, *, batch=False):
+            raise IndexError("tuple index out of range")
+
+        monkeypatch.setattr(batch_service, "lookup_by_address", explodes)
+        job = await batch_service.submit(["1 RAISE ST"])
+        await worker.step()
+
+        row = get_connection().execute(
+            "SELECT state, attempts, error_type, next_attempt_at FROM batch_items"
+        ).fetchone()
+        assert (row["state"], row["attempts"], row["error_type"]) == ("pending", 1, "error")
+        assert row["next_attempt_at"], "retried with backoff like any error"
+
+        monkeypatch.setattr(batch_service, "lookup_by_address", lookup_mod.lookup_by_address)
+        make_all_due()
+        await run_until_idle(worker)
+        assert store.get_job(job["job_id"])["state"] == "completed"
+
+    async def test_a_failed_step_releases_orphaned_in_flight_items(self, scraper, worker):
+        await batch_service.submit(["1 ORPHAN ST"])
+        store.claim_key("1 ORPHAN ST", store.WORKABLE_JOB_STATES)
+        assert store.release_in_flight() == 1
+        assert store.next_due_item(store.WORKABLE_JOB_STATES)["address_raw"] == "1 ORPHAN ST"
+
     async def test_parse_empty_fails_without_retry(self, scraper, worker, alerts):
         scraper.set("4 ODD ST", FailureType.PARSE_EMPTY)
         job = await batch_service.submit(["4 ODD ST"])
@@ -236,12 +266,30 @@ class TestCircuitBreaker:
         await worker.step()
         assert worker.paused
 
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # so the success timestamp is strictly later
         browser_manager.record_success()  # e.g. a live /address lookup worked
         await worker.step()
 
         assert not worker.paused
         assert store.get_job(job["job_id"])["state"] == "running"
+
+    async def test_a_timed_out_probe_does_not_resume(self, scraper, worker, alerts, monkeypatch):
+        """Probe "until one succeeds": a timeout proves nothing about blocking."""
+        monkeypatch.setattr(settings, "batch_pause_after_blocked", 2)
+        scraper.default = FailureType.BLOCKED
+        job = await batch_service.submit(["1 T ST", "2 T ST", "3 T ST"])
+        await worker.step()
+        await worker.step()
+        assert worker.paused
+
+        scraper.default = FailureType.TIMEOUT
+        worker.next_probe_at = 0
+        before = worker.probe_delay
+        await worker.step()
+
+        assert worker.paused
+        assert worker.probe_delay == before * 2
+        assert store.get_job(job["job_id"])["state"] == "paused"
 
     async def test_jobs_submitted_while_paused_start_paused(
         self, scraper, worker, alerts, monkeypatch
