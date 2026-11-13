@@ -19,6 +19,7 @@ from app.config import settings
 from app.schemas import AssessmentResult, FailureType, LookupOutcome
 from app.services import lookup as lookup_mod
 from app.services.rate_limit import BCRateLimiter
+from app.services.scrape_gate import ScrapeGate
 
 
 class NullLimiter:
@@ -49,9 +50,9 @@ class FakeClock:
 
 @pytest.fixture(autouse=True)
 def fresh_locks(monkeypatch):
-    """`_scrape_lock` is built at import time and binds to the first event loop
+    """`_scrape_gate` is built at import time and binds to the first event loop
     that awaits it, so each test needs its own."""
-    monkeypatch.setattr(lookup_mod, "_scrape_lock", asyncio.Semaphore(1))
+    monkeypatch.setattr(lookup_mod, "_scrape_gate", ScrapeGate())
     monkeypatch.setattr(lookup_mod, "_queue_lock", asyncio.Lock())
     monkeypatch.setattr(lookup_mod, "_queue_depth", 0)
     monkeypatch.setattr(lookup_mod, "bc_rate_limiter", NullLimiter())
@@ -361,3 +362,90 @@ class TestBusyRetryAfter:
     def test_success_response_has_no_retry_after(self, client):
         response = client.get("/address", params={"address": "7009 TISDALL ST VANCOUVER"})
         assert "Retry-After" not in response.headers
+
+
+class TestPriorityGate:
+    async def test_a_live_request_overtakes_50_queued_batch_items(self, monkeypatch):
+        """B5: when the slot frees, a waiting live request goes before any batch
+        item — it waits behind at most the one scrape already in progress."""
+        order: list[str] = []
+        release_first = asyncio.Event()
+
+        async def recording_scrape(address):
+            if address == "BATCH-0":
+                await release_first.wait()
+            order.append(address)
+            return _ok()
+
+        monkeypatch.setattr(lookup_mod, "_scrape_once", recording_scrape)
+
+        first = asyncio.create_task(lookup_mod._run_scrape("BATCH-0", batch=True))
+        await asyncio.sleep(0.02)  # BATCH-0 now holds the slot
+        queued = [
+            asyncio.create_task(lookup_mod._run_scrape(f"BATCH-{i}", batch=True))
+            for i in range(1, 51)
+        ]
+        await asyncio.sleep(0.02)
+        live = asyncio.create_task(lookup_mod._run_scrape("LIVE"))
+        await asyncio.sleep(0.02)
+
+        release_first.set()
+        await asyncio.wait_for(asyncio.gather(first, live, *queued), timeout=10)
+
+        assert order[0] == "BATCH-0", "the scrape in progress is never interrupted"
+        assert order[1] == "LIVE", f"live request was served at position {order.index('LIVE')}"
+        assert len(order) == 52
+
+    async def test_batch_does_not_take_the_slot_while_live_demand_exists(self):
+        gate = ScrapeGate()
+        async with gate.live_demand():
+            batch = asyncio.create_task(_enter(gate, batch=True))
+            await asyncio.sleep(0.05)
+            assert not batch.done(), "batch took the slot ahead of live demand"
+        await asyncio.wait_for(batch, timeout=1)
+
+    async def test_batch_never_sleeps_while_holding_the_slot(self, monkeypatch):
+        """With the batch share exhausted the batch caller sleeps, but outside
+        the gate: a live request gets through immediately."""
+        from app.services.rate_limit import BCRateLimitGroup
+
+        limiter = BCRateLimitGroup(
+            batch_limiters=(BCRateLimiter(1, 3600.0, label="batch"),)
+        )
+        assert limiter.try_acquire(batch=True) == 0  # exhaust the batch share
+        monkeypatch.setattr(lookup_mod, "bc_rate_limiter", limiter)
+
+        async def immediate(address):
+            return _ok()
+
+        monkeypatch.setattr(lookup_mod, "_scrape_once", immediate)
+
+        batch = asyncio.create_task(lookup_mod._run_scrape("BATCH", batch=True))
+        await asyncio.sleep(0.1)
+        assert not lookup_mod._scrape_gate.held, "batch is sleeping with the slot held"
+
+        started = time.monotonic()
+        live = await lookup_mod._run_scrape("LIVE")
+        assert live.ok
+        assert time.monotonic() - started < 0.5
+
+        batch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch
+
+    async def test_batch_scrapes_are_never_shed_as_busy(self, monkeypatch):
+        monkeypatch.setattr(settings, "scrape_max_queue_depth", 1)
+
+        async def immediate(address):
+            return _ok()
+
+        monkeypatch.setattr(lookup_mod, "_scrape_once", immediate)
+        results = await asyncio.gather(
+            *(lookup_mod._run_scrape(f"B{i}", batch=True) for i in range(5))
+        )
+        assert all(r.ok for r in results)
+
+
+async def _enter(gate: ScrapeGate, *, batch: bool) -> None:
+    async with gate.slot(batch=batch):
+        return None

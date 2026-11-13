@@ -25,6 +25,7 @@ from app.db.cache import cache_get, cache_set
 from app.schemas import AssessmentResult, FailureType, LookupOutcome
 from app.services.browser import browser_manager
 from app.services.rate_limit import bc_rate_limiter
+from app.services.scrape_gate import ScrapeGate
 from app.services.scraper import BC_URL, scrape_address
 from app.services.stats import (
     is_valid_assessment,
@@ -38,7 +39,8 @@ from app.services.stats import (
 
 logger = logging.getLogger(__name__)
 
-_scrape_lock = asyncio.Semaphore(1)
+# Single-flight scrape slot; live requests are served before batch items.
+_scrape_gate = ScrapeGate()
 _queue_depth = 0
 _queue_lock = asyncio.Lock()
 
@@ -119,9 +121,27 @@ def _busy(reason: str, wait_seconds: float) -> LookupOutcome:
     )
 
 
-async def _run_scrape(address: str) -> LookupOutcome:
+async def _run_batch_scrape(address: str) -> LookupOutcome:
+    """Batch path: wait (never shed), yield to live traffic, never sleep holding
+    the slot. Sleeps happen only in this loop, outside the gate."""
+    while True:
+        wait = bc_rate_limiter.projected_wait(batch=True)
+        if wait > 0 or _scrape_gate.live_pending:
+            await asyncio.sleep(max(wait, 0.05))
+            continue
+        async with _scrape_gate.slot(batch=True):
+            # A live request may have taken the token while we waited for the
+            # slot; if so, release it and go back to sleeping outside the gate.
+            if bc_rate_limiter.try_acquire(batch=True) == 0:
+                return await _scrape_with_ceiling(address)
+
+
+async def _run_scrape(address: str, *, batch: bool = False) -> LookupOutcome:
     """Rate-limit, then scrape under a hard timeout and a single-flight lock."""
     global _queue_depth
+
+    if batch:
+        return await _run_batch_scrape(address)
 
     max_depth = settings.scrape_max_queue_depth
     async with _queue_lock:
@@ -141,22 +161,25 @@ async def _run_scrape(address: str) -> LookupOutcome:
         _queue_depth += 1
 
     try:
-        # Outside the scrape lock on purpose — see the module docstring. With a
-        # max_wait the limiter returns the projected wait instead of sleeping
-        # past it, so this request never hangs at the hourly cap.
-        max_wait = settings.scrape_max_projected_wait_seconds
-        wait = await bc_rate_limiter.acquire(max_wait=max_wait)
-        if wait is not None:
-            logger.warning(
-                "Rejecting lookup for %r: projected rate-limit wait %.0fs > %.0fs",
-                address,
-                wait,
-                max_wait,
-            )
-            return _busy(f"rate limit reached; projected wait {wait:.0f}s", wait)
+        # Registering live demand first makes queued batch work yield both the
+        # rate-limit token and the scrape slot to this request.
+        async with _scrape_gate.live_demand():
+            # Outside the scrape slot on purpose — see the module docstring.
+            # With a max_wait the limiter returns the projected wait instead of
+            # sleeping past it, so this request never hangs at the hourly cap.
+            max_wait = settings.scrape_max_projected_wait_seconds
+            wait = await bc_rate_limiter.acquire(max_wait=max_wait)
+            if wait is not None:
+                logger.warning(
+                    "Rejecting lookup for %r: projected rate-limit wait %.0fs > %.0fs",
+                    address,
+                    wait,
+                    max_wait,
+                )
+                return _busy(f"rate limit reached; projected wait {wait:.0f}s", wait)
 
-        async with _scrape_lock:
-            return await _scrape_with_ceiling(address)
+            async with _scrape_gate.slot():
+                return await _scrape_with_ceiling(address)
     finally:
         async with _queue_lock:
             _queue_depth -= 1
